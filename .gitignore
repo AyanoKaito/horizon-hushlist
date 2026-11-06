@@ -1,0 +1,47 @@
+# Private working notes (kept on the author's machine only)
+/private/
+
+# Agent instructions and local tool configuration
+/AGENTS.md
+/CLAUDE.md
+/.claude/
+/.opencode/
+/.specify/
+opencode.local.json
+opencode.local.jsonc
+
+# Local experiments, upstream source copies and native staging
+/.local/
+
+# Rust build output
+target/
+
+# Player data and generated artifacts
+test-data/
+worlds/
+saves/
+logs/
+dist/
+*.hmod
+*.hnmod
+*.jar
+
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+*.key
+*.minisig
+secrets.json
+
+# Python tooling
+.venv/
+__pycache__/
+*.py[cod]
+
+# Editors and OS files
+.obsidian/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
