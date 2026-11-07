@@ -6,9 +6,9 @@ Hushlist is a native mod for [Horizon](https://playhorizon.dev), a reimplementat
 
 ## Status
 
-**Early research and design. There is nothing to install yet.**
+**Early development. There is nothing to install yet.**
 
-The project started on 6 November 2026. Current work:
+The project started on 6 November 2026. A technical prototype (no player interface) already changes the volume of individual sounds in the game; see the [research log](docs/research/log.md). Current work:
 
 - player scenarios and the scope of the first version: [docs/concept.md](docs/concept.md);
 - decisions made so far: [docs/decisions.md](docs/decisions.md);

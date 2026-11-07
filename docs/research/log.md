@@ -2,6 +2,31 @@
 
 Dated record of what was checked and what it proved. Each entry separates what was confirmed from what was not.
 
+## 2026-11-07 — Technical prototype 0.1.0
+
+**Pin:** Horizon Nightly `6560641ba51a452f6bc2407baa4eb1b3be517ca8` (2026-11-07).
+
+**Finding:** Horizon now has a client sound hook, `horizon_client_lib::sound_playback::native_sound_play` (added 2026-11-06, not yet assigned a hooks API number). For every sound start and live update it passes the sound event ID, sound category, position and whether the sound is starting, and lets a mod change the volume or cancel the operation. Hushlist injects into it with `horizon-mixins` instead of patching the sound engine.
+
+**Bundle:** one module (settings, effective volume, cooldowns, recent list) and two injections (sound hook, Mods list entry). Settings come from `config/hushlist/settings.txt` and are reloaded while the game runs. No player interface yet.
+
+**Confirmed:**
+- 10 standalone unit tests passed (groups, volume resolution, parsing, cooldowns, recent list, live refresh).
+- `horizon-mixins apply` (tool `4342a0bf`): 2 injections, 1 module.
+- Native Dev build of the transformed source: passed (25 min, cold cache).
+- Isolated single-player run with audio enabled and master volume 1 %, trace from the mod:
+  - without settings, 18 villager ambient starts played at the normal volume;
+  - with that sound set to 0 %, all 14 starts were silenced, and the settings file was reloaded without restarting the game;
+  - with a 10 s cooldown, 4 starts played and 11 were skipped; gaps between played starts were 10.4–12.9 s;
+  - a music disc started at the normal volume; after its group was set to 20 %, the playing disc was updated to 20 % without restarting.
+- No errors in the game log.
+
+**Not confirmed:**
+- The Mods list entry was not checked in the run.
+- LAN, dedicated servers, and sounds other than those above.
+- Whether lowering volume changes hearing range in practice. From the source: the range uses `max(volume, 1)`, so it changes only for sounds whose base volume is above 1.
+- The hook has no API number yet; its signature may change when it gets one.
+
 ## 2026-11-06 — Project start
 
 - Chose the name Hushlist and created this repository.

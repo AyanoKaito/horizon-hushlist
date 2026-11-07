@@ -1,0 +1,14 @@
+[package]
+name = "horizon-hushlist"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Per-sound volume control for Horizon"
+publish = false
+license = "MIT"
+
+[lib]
+path = "mixins/hushlist/core.rs"
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -24,7 +24,7 @@ Relevant pieces:
 
 ## What this means for Hushlist
 
-- **No named per-sound hook.** Horizon's native mod API has no hook for intercepting or adjusting individual sounds. Hushlist will inject into game functions with `horizon-mixins`. A request for an official hook is open as [horizon-rust/horizon#10444](https://github.com/horizon-rust/horizon/issues/10444).
+- **Per-sound hook (update 2026-11-07).** At `c5bf899` Horizon had no hook for individual sounds. Since 2026-11-06 it has `native_sound_play` (`crates/horizon-client/src/sound_playback.rs`): sound event ID, category, position and a starting flag, with editable volume and pitch and a cancel flag. It has no hooks API number yet. Hushlist injects into it with `horizon-mixins`; see the [research log](log.md).
 - **Changing volume only at start is not enough.** Long sounds, such as ambience and loops, get volume updates while playing. A change must apply for the whole life of a sound, and must be visible immediately when the player moves a slider.
 - **`get_volume` has more than one use.** Besides loudness, its result also feeds the calculation of how far a sound can be heard. Adjusting it directly may change hearing range as a side effect. This must be checked before choosing it as the injection point.
 - **Subtitle events are not a full sound log.** The subtitle feed skips sounds without subtitles and does not expose sound IDs. The live list needs its own record of played sounds, most likely captured where sounds start.
