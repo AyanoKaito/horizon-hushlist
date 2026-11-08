@@ -27,6 +27,13 @@ search.placeholder=Name, ID or category
 empty.nothing=Nothing found
 group.from=from group “{name}”
 
+# Less often (cooldown)
+cooldown.label=Less often
+cooldown.off=default
+cooldown.badge={time} cooldown
+cooldown.secs={n} s
+cooldown.mins={n} min
+
 # Sound categories (chips)
 cat.block=Blocks
 cat.neutral=Friendly

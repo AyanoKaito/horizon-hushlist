@@ -29,6 +29,42 @@ pub const CATEGORIES: [(usize, &str); 9] = [
 ];
 /// Longest search text.
 pub const QUERY_MAX: usize = 40;
+/// Cooldown slider steps in seconds; 0 is "default" (no cooldown).
+pub const RATES: [u32; 16] = [0, 1, 2, 3, 5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 300, 600];
+
+/// Slider step of a cooldown: the first step at or above it.
+pub fn rate_index(secs: u32) -> usize {
+    RATES.iter().position(|r| *r >= secs).unwrap_or(RATES.len() - 1)
+}
+
+/// Cooldown step for a pointer at `x` on the slider.
+pub fn rate_value(slider: Rect, x: f32) -> usize {
+    let t = ((x - slider[0] - 2.0) / (slider[2] - 4.0)).clamp(0.0, 1.0);
+    (t * (RATES.len() - 1) as f32).round() as usize
+}
+
+/// `30 s`, `1.5 min` (`30 с`, `1,5 мин` in Russian), in the language `lang`.
+pub fn rate_text(secs: u32, lang: &str) -> String {
+    use crate::i18n::with_n;
+    if secs < 60 {
+        return with_n(lang, "cooldown.secs", secs);
+    }
+    let mins = secs as f32 / 60.0;
+    let mut n = if mins.fract() == 0.0 { format!("{}", mins as u32) } else { format!("{mins:.1}") };
+    if lang.starts_with("ru") {
+        n = n.replace('.', ",");
+    }
+    with_n(lang, "cooldown.mins", n)
+}
+
+/// "30 s cooldown" for the badge and the drawer, or "default" for none.
+pub fn cooldown_text(secs: u32, lang: &str) -> String {
+    use crate::i18n::text;
+    if secs == 0 {
+        return text(lang, "cooldown.off").to_owned();
+    }
+    text(lang, "cooldown.badge").replace("{time}", &rate_text(secs, lang))
+}
 
 /// The chip's translation key for a sound source index.
 pub fn category_key(source: usize) -> Option<&'static str> {
@@ -42,6 +78,8 @@ pub enum Key {
     Group(String),
     Sound(String),
     More(String),
+    /// The open "less often" drawer under a sound.
+    Cooldown(String),
 }
 
 /// Every sound event of the game by group, sorted, for showing a group's unheard sounds.
@@ -110,6 +148,8 @@ pub struct Row {
     pub own: bool,
     /// Below 100 % because of its group.
     pub inherited: bool,
+    /// Sound rows and drawers: cooldown in seconds, 0 for none.
+    pub cooldown: u32,
 }
 
 /// The list's order frozen by the Freeze button.
@@ -142,6 +182,8 @@ pub struct ListState {
     pub cats: Vec<usize>,
     /// Flat list instead of groups.
     pub flat: bool,
+    /// The sound whose "less often" drawer is open (one at a time).
+    pub drawer: Option<String>,
 }
 
 impl ListState {
@@ -230,7 +272,7 @@ pub fn snapshot(heard: &[HeardView], flat: bool) -> Snapshot {
             .iter()
             .filter_map(|e| match &e.key {
                 Key::Group(g) => Some((g.clone(), e.kids.clone())),
-                Key::Sound(_) | Key::More(_) => None,
+                Key::Sound(_) | Key::More(_) | Key::Cooldown(_) => None,
             })
             .collect(),
     }
@@ -277,7 +319,7 @@ pub fn build(
                             kids: known.into_iter().filter(|k| e.kids.contains(k)).collect(),
                         }
                     }
-                    Key::Sound(_) | Key::More(_) => e.clone(),
+                    Key::Sound(_) | Key::More(_) | Key::Cooldown(_) => e.clone(),
                 })
                 .collect()
         }
@@ -311,6 +353,7 @@ pub fn build(
                     volume,
                     own: settings.groups.contains_key(g),
                     inherited: false,
+                    cooldown: 0,
                 });
                 if open {
                     rows.extend(kids.iter().map(|k| sound_row(k, settings, true)));
@@ -338,10 +381,38 @@ pub fn build(
                     }
                 }
             }
-            Key::More(_) => {}
+            Key::More(_) | Key::Cooldown(_) => {}
         }
     }
+    // The open drawer sits right under its sound.
+    if let Some(id) = &st.drawer
+        && let Some(i) = rows.iter().position(|r| r.key == Key::Sound(id.clone()))
+    {
+        let child = rows[i].child;
+        rows.insert(i + 1, cooldown_row(id, child, settings));
+    }
     (rows, fresh)
+}
+
+fn cooldown_secs(settings: &Settings, id: &str) -> u32 {
+    settings.cooldowns.get(id).copied().unwrap_or(0)
+}
+
+fn cooldown_row(id: &str, child: bool, settings: &Settings) -> Row {
+    Row {
+        key: Key::Cooldown(id.to_owned()),
+        child,
+        open: true,
+        playing: false,
+        flash: false,
+        secs: f32::INFINITY,
+        count: 0,
+        heard: Vec::new(),
+        volume: 100,
+        own: cooldown_secs(settings, id) > 0,
+        inherited: false,
+        cooldown: cooldown_secs(settings, id),
+    }
 }
 
 /// The button under an expanded group: "N more in this group", or "heard only" while all are shown.
@@ -358,6 +429,7 @@ fn more_row(group: &str, rest: usize, showing_all: bool) -> Row {
         volume: 100,
         own: false,
         inherited: false,
+        cooldown: 0,
     }
 }
 
@@ -376,6 +448,7 @@ fn sound_row(h: &HeardView, settings: &Settings, child: bool) -> Row {
         volume,
         own,
         inherited: !own && volume < 100,
+        cooldown: cooldown_secs(settings, &h.id),
     }
 }
 
@@ -468,12 +541,15 @@ pub struct Cols {
     pub slider: Rect,
     pub pct: Rect,
     pub reset: Rect,
+    /// Sound rows: opens the "less often" drawer.
+    pub timer: Rect,
 }
 
 /// Row parts, right to left. The slider grows with the screen.
 pub fn columns(row: Rect, child: bool) -> Cols {
     let [x, y, w, h] = row;
-    let reset = [x + w - 16.0, y, 14.0, h];
+    let timer = [x + w - 16.0, y, 14.0, h];
+    let reset = [timer[0] - 16.0, y, 14.0, h];
     let pct = [reset[0] - 30.0, y, 28.0, h];
     let slider_w = (w * 0.28).clamp(70.0, 170.0);
     let slider = [pct[0] - 4.0 - slider_w, y, slider_w, h];
@@ -491,6 +567,7 @@ pub fn columns(row: Rect, child: bool) -> Cols {
         slider,
         pct,
         reset,
+        timer,
     }
 }
 
@@ -535,6 +612,11 @@ pub enum Hit {
     Chip(usize),
     ViewFlat,
     ViewGroup,
+    /// A sound row's timer: open or close its drawer.
+    Timer(usize),
+    /// A drawer's slider, with the cooldown step under the pointer.
+    CooldownSlider(usize, usize),
+    CooldownReset(usize),
     Freeze,
     Banner,
     Speaker(usize),
@@ -578,6 +660,18 @@ pub fn hit(lay: &Layout, rows: &[Row], scroll: f32, p: [f32; 2]) -> Hit {
             return Hit::Row(i);
         }
         let c = columns(r, rows[i].child);
+        if matches!(rows[i].key, Key::Cooldown(_)) {
+            return if contains(c.slider, p) {
+                Hit::CooldownSlider(i, rate_value(c.slider, p[0]))
+            } else if contains(c.reset, p) && rows[i].cooldown > 0 {
+                Hit::CooldownReset(i)
+            } else {
+                Hit::Nothing
+            };
+        }
+        if contains(c.timer, p) {
+            return if matches!(rows[i].key, Key::Sound(_)) { Hit::Timer(i) } else { Hit::Nothing };
+        }
         return if contains(c.speaker, p) {
             Hit::Speaker(i)
         } else if contains(c.slider, p) {
@@ -689,6 +783,7 @@ mod tests {
                 Key::Group(g) => format!("G:{g}"),
                 Key::Sound(s) => format!("{}{s}", if r.child { "  " } else { "S:" }),
                 Key::More(g) => format!("M:{g}"),
+                Key::Cooldown(s) => format!("K:{s}"),
             })
             .collect()
     }
@@ -800,7 +895,7 @@ mod tests {
             assert!(lay.list[1] + lay.list[3] <= lay.freeze[1]);
             for child in [false, true] {
                 let c = columns([lay.list[0], 0.0, lay.list[2], ROW_H], child);
-                let order = [c.ind, c.name, c.when, c.speaker, c.slider, c.pct, c.reset];
+                let order = [c.ind, c.name, c.when, c.speaker, c.slider, c.pct, c.reset, c.timer];
                 for pair in order.windows(2) {
                     assert!(pair[0][0] + pair[0][2] <= pair[1][0] + 0.01, "{w}: {pair:?}");
                 }
@@ -957,6 +1052,38 @@ mod tests {
     }
 
     #[test]
+    fn open_drawer_sits_under_its_sound_and_its_parts_are_hit() {
+        let heard = [h("entity.cow.ambient", 1.0, false), h("entity.cow.step", 2.0, false)];
+        let s = Settings::parse("cooldown entity.cow.step 30\n");
+        let st = ListState { drawer: Some("entity.cow.step".into()), ..ListState::default() };
+        let (rows, _) = build(&heard, &s, &st, &Catalog::default(), &|_| true);
+        assert_eq!(keys(&rows), ["G:entity.cow", "  entity.cow.ambient", "  entity.cow.step", "K:entity.cow.step"]);
+        assert_eq!((rows[2].cooldown, rows[3].cooldown), (30, 30));
+        let lay = layout(640.0, 360.0, false, &[]);
+        let vis = visible(rows.len(), lay.list, 0.0);
+        let mid = |r: Rect| [r[0] + r[2] / 2.0, r[1] + r[3] / 2.0];
+        let c = columns(vis[3].1, true);
+        assert_eq!(hit(&lay, &rows, 0.0, mid(c.reset)), Hit::CooldownReset(3));
+        assert_eq!(hit(&lay, &rows, 0.0, [c.slider[0] + c.slider[2] - 1.0, mid(c.slider)[1]]), Hit::CooldownSlider(3, 15));
+        assert_eq!(hit(&lay, &rows, 0.0, mid(columns(vis[1].1, true).timer)), Hit::Timer(1));
+        assert_eq!(hit(&lay, &rows, 0.0, mid(columns(vis[0].1, false).timer)), Hit::Nothing);
+    }
+
+    #[test]
+    fn cooldown_steps_and_text() {
+        assert_eq!(rate_index(30), 8);
+        assert_eq!(rate_index(31), 9);
+        assert_eq!(rate_index(9999), 15);
+        assert_eq!(RATES[rate_index(0)], 0);
+        assert_eq!(rate_text(30, "en_us"), "30 s");
+        assert_eq!(rate_text(90, "en_us"), "1.5 min");
+        assert_eq!(rate_text(120, "en_us"), "2 min");
+        assert_eq!(cooldown_text(0, "en_us"), "default");
+        assert_eq!(cooldown_text(45, "en_us"), "45 s cooldown");
+        assert!(rate_text(90, "ru_ru").contains("1,5"));
+    }
+
+    #[test]
     fn when_text_reads_naturally() {
         let mut r = Row {
             key: Key::Sound("a.b.c".into()),
@@ -970,6 +1097,7 @@ mod tests {
             volume: 100,
             own: false,
             inherited: false,
+            cooldown: 0,
         };
         assert_eq!(when_text(&r, "en_us"), "now");
         r.secs = 12.4;

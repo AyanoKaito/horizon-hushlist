@@ -27,6 +27,13 @@ search.placeholder=Название, ID или категория
 empty.nothing=Ничего не найдено
 group.from=из группы “{name}”
 
+# Less often (cooldown)
+cooldown.label=Реже
+cooldown.off=как в игре
+cooldown.badge=перерыв {time}
+cooldown.secs={n} с
+cooldown.mins={n} мин
+
 # Sound categories (chips)
 cat.block=Блоки
 cat.neutral=Мирные

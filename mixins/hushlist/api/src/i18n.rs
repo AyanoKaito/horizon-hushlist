@@ -57,7 +57,7 @@ mod tests {
     use super::*;
 
     fn placeholders(s: &str) -> Vec<&str> {
-        ["{n}", "{list}"].into_iter().filter(|p| s.contains(p)).collect()
+        ["{n}", "{list}", "{time}", "{name}"].into_iter().filter(|p| s.contains(p)).collect()
     }
 
     #[test]

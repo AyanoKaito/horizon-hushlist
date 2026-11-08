@@ -64,6 +64,7 @@ enum Icon {
     SpeakerLow = 1,
     SpeakerOff = 2,
     Reset = 3,
+    Timer = 4,
     Play = 5,
     Snowflake = 6,
     Close = 7,
@@ -133,6 +134,8 @@ struct State {
     catalog: ui::Catalog,
     /// When the visible rows were last written for tests (`HUSHLIST_TRACE`).
     rows_dumped: Option<Instant>,
+    /// Cooldown badges drawn in the last frame, with their sound: a click opens the drawer.
+    badges: Vec<(Rect, String)>,
     /// When the live order was last refreshed.
     live_at: Option<Instant>,
 }
@@ -353,7 +356,7 @@ impl State {
         match key {
             Key::Sound(id) => s.sounds.insert(id.clone(), value),
             Key::Group(g) => s.groups.insert(g.clone(), value),
-            Key::More(_) => return,
+            Key::More(_) | Key::Cooldown(_) => return,
         };
         self.changed(now);
     }
@@ -363,10 +366,25 @@ impl State {
         match key {
             Key::Sound(id) => s.sounds.remove(id),
             Key::Group(g) => s.groups.remove(g),
-            Key::More(_) => return,
+            Key::More(_) | Key::Cooldown(_) => return,
         };
         self.list.before_mute.remove(key);
         self.changed(now);
+    }
+
+    /// Sets a sound's cooldown (0 removes it). It applies to the next start, so only the file changes.
+    fn set_cooldown(&mut self, id: &str, secs: u32, now: Instant) {
+        let c = &mut self.engine.settings.cooldowns;
+        if secs == 0 {
+            c.remove(id);
+        } else {
+            c.insert(id.to_owned(), secs);
+        }
+        self.dirty_at = Some(now);
+    }
+
+    fn toggle_drawer(&mut self, id: &str) {
+        self.list.drawer = if self.list.drawer.as_deref() == Some(id) { None } else { Some(id.to_owned()) };
     }
 
     fn toggle_mute(&mut self, row: &Row, now: Instant) {
@@ -575,6 +593,11 @@ impl Hooks for Hushlist {
         let mut st = self.lock();
         let (views, rows, fresh) = st.rows(now);
         let lay = st.layout(host, fresh);
+        if let Some(id) = st.badges.iter().find(|(r, _)| ui::contains(*r, event.screen.mouse)).map(|(_, id)| id.clone()) {
+            st.list.search_focus = false;
+            st.toggle_drawer(&id);
+            return Flow::Cancel;
+        }
         let hit = ui::hit(&lay, &rows, st.list.scroll, event.screen.mouse);
         // A click anywhere else gives the keyboard back to the game's keys.
         st.list.search_focus = matches!(hit, Hit::Search | Hit::SearchClear);
@@ -615,6 +638,22 @@ impl Hooks for Hushlist {
                 st.set_volume(&rows[i].key, v, now);
             }
             Hit::Reset(i) => st.reset(&rows[i].key, now),
+            Hit::Timer(i) => {
+                if let Key::Sound(id) = &rows[i].key {
+                    st.toggle_drawer(id);
+                }
+            }
+            Hit::CooldownSlider(i, step) => {
+                if let Key::Cooldown(id) = &rows[i].key {
+                    st.drag = Some(rows[i].key.clone());
+                    st.set_cooldown(id, ui::RATES[step], now);
+                }
+            }
+            Hit::CooldownReset(i) => {
+                if let Key::Cooldown(id) = &rows[i].key {
+                    st.set_cooldown(id, 0, now);
+                }
+            }
             Hit::Row(i) => match &rows[i].key {
                 Key::Group(g) => {
                     let open = !rows[i].open;
@@ -626,6 +665,7 @@ impl Hooks for Hushlist {
                         st.list.show_all.insert(g.clone());
                     }
                 }
+                Key::Cooldown(_) => {}
             },
             Hit::Nothing => {}
         }
@@ -658,8 +698,13 @@ impl Hooks for Hushlist {
             .find(|(i, _)| rows[*i].key == key)
         {
             let slider = ui::columns(r, rows[i].child).slider;
-            let v = ui::slider_value(slider, event.screen.mouse[0]);
-            st.set_volume(&key, v, now);
+            if let Key::Cooldown(id) = &key {
+                let step = ui::rate_value(slider, event.screen.mouse[0]);
+                st.set_cooldown(id, ui::RATES[step], now);
+            } else {
+                let v = ui::slider_value(slider, event.screen.mouse[0]);
+                st.set_volume(&key, v, now);
+            }
         }
         Flow::Cancel
     }
@@ -809,12 +854,12 @@ fn dump_rows(st: &mut State, rows: &[Row], lay: &ui::Layout, now: Instant) {
         .into_iter()
         .map(|(i, r)| {
             format!(
-                "{{\"id\":\"{}\",\"child\":{},\"own\":{},\"volume\":{},\"count\":{},\"name\":{:?},\"rect\":[{},{},{},{}]}}",
-                row_id(&rows[i]), rows[i].child, rows[i].own, rows[i].volume, rows[i].count,
+                "{{\"id\":\"{}\",\"child\":{},\"own\":{},\"volume\":{},\"count\":{},\"cooldown\":{},\"name\":{:?},\"rect\":[{},{},{},{}]}}",
+                row_id(&rows[i]), rows[i].child, rows[i].own, rows[i].volume, rows[i].count, rows[i].cooldown,
                 match &rows[i].key {
                     Key::Group(g) => group_name(g),
                     Key::Sound(s) => sound_name(&st.subtitles, s),
-                    Key::More(_) => String::new(),
+                    Key::More(_) | Key::Cooldown(_) => String::new(),
                 },
                 r[0], r[1], r[2], r[3]
             )
@@ -839,6 +884,7 @@ fn row_id(row: &Row) -> String {
         Key::Group(g) => format!("g:{g}"),
         Key::Sound(s) => format!("{}:{s}", if row.child { "c" } else { "s" }),
         Key::More(g) => format!("m:{g}"),
+        Key::Cooldown(s) => format!("k:{s}"),
     }
 }
 
@@ -987,6 +1033,7 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
     }
 
     let list = lay.list;
+    st.badges.clear();
     let had_rows = !st.anim.y.is_empty();
     let mut seen = std::collections::HashSet::new();
     for (i, target) in ui::visible(rows.len(), list, st.list.scroll) {
@@ -1018,6 +1065,43 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
         if row.secs < ui::FLASH_SECS {
             let f = 1.0 - row.secs / ui::FLASH_SECS;
             bg = mix(bg, ROW_FLASH, f * f * (3.0 - 2.0 * f));
+        }
+        if let Key::Cooldown(_) = &row.key {
+            // The "less often" drawer: label and value on the left, a stepped slider under the
+            // volume slider, its own reset under the volume reset.
+            let left = if row.child { r[0] + ui::CHILD_INDENT } else { r[0] };
+            rrect(host, b, [left, r[1] - ui::ROW_GAP, r[0] + r[2] - left, r[3] + ui::ROW_GAP], 3.0, fade(ROW, reveal));
+            let label = tr("cooldown.label");
+            host.text(b, label, [c.name[0], r[1] + 7.0], TEXT, false);
+            let value = ui::cooldown_text(row.cooldown, &code);
+            let vrgb = if row.cooldown > 0 { OWN } else { DIM };
+            host.text(b, &value, [c.name[0] + host.text_width(label) + 8.0, r[1] + 7.0], vrgb, false);
+            let s = c.slider;
+            let cy = (s[1] + s[3] / 2.0).floor();
+            let steps = (ui::RATES.len() - 1) as f32;
+            let at = ui::rate_index(row.cooldown) as f32 / steps;
+            rrect(host, b, [s[0] + 2.0, cy - 1.5, s[2] - 4.0, 3.0], 1.5, TRACK);
+            for k in 1..ui::RATES.len() - 1 {
+                let tx = (s[0] + 2.0 + (s[2] - 4.0) * k as f32 / steps).floor();
+                host.fill(b, [tx, cy + 3.0, 1.0, 2.0], 0x40_FF_FF_FF);
+            }
+            let filled = (s[2] - 4.0) * at;
+            rrect(host, b, [s[0] + 2.0, cy - 1.5, filled, 3.0], 1.5, argb(if row.cooldown > 0 { OWN } else { DIM }));
+            let grow = if st.drag.as_ref() == Some(&row.key) || (hover && ui::contains(s, mouse)) { 1.0 } else { 0.0 };
+            rrect(
+                host,
+                b,
+                [s[0] + 2.0 + filled - 2.5 - grow * 0.5, cy - 5.0 - grow, 5.0 + grow, 10.0 + grow * 2.0],
+                2.5,
+                THUMB,
+            );
+            if row.cooldown > 0 {
+                if hover && ui::contains(c.reset, mouse) {
+                    rrect(host, b, [c.reset[0] - 1.0, r[1] + 3.0, 16.0, r[3] - 6.0], 3.0, ROW_HOVER);
+                }
+                icon(host, b, Icon::Reset, Tone::Own, [c.reset[0] + 1.0, c.reset[1], ICON_SIZE, c.reset[3]]);
+            }
+            continue;
         }
         if let Key::More(_) = &row.key {
             // A quiet button, not a sound row: no background, a thin outline, one label.
@@ -1065,12 +1149,25 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
                 };
                 (sound_name(&st.subtitles, sid), format!("{source}minecraft:{sid}"))
             }
-            Key::More(_) => unreachable!("drawn above"),
+            Key::More(_) | Key::Cooldown(_) => unreachable!("drawn above"),
         };
         // The game font has no italics for mods, so a name made from the ID is drawn dimmer.
         let technical = matches!(&row.key, Key::Sound(sid) if technical_name(&st.subtitles, sid));
         let name_rgb = if row.volume == 0 { FAINT } else if technical { DIM } else { TEXT };
-        host.text(b, &fit(host, &name, c.name[2]), [c.name[0], r[1] + 3.0], name_rgb, false);
+        let badge = (row.cooldown > 0).then(|| ui::cooldown_text(row.cooldown, &code));
+        let badge_w = badge.as_ref().map_or(0.0, |t| host.text_width(t) + 10.0);
+        let name_room = if badge.is_some() { (c.name[2] - badge_w - 4.0).max(0.0) } else { c.name[2] };
+        let shown_name = fit(host, &name, name_room);
+        host.text(b, &shown_name, [c.name[0], r[1] + 3.0], name_rgb, false);
+        if let (Some(text), Key::Sound(sid)) = (&badge, &row.key) {
+            let bx = c.name[0] + host.text_width(&shown_name) + 4.0;
+            let br = [bx, r[1] + 2.0, badge_w, 10.0];
+            let edge = if ui::contains(br, mouse) { 0x99_6F_F0_DA } else { 0x59_6F_F0_DA };
+            rrect(host, b, br, 5.0, edge);
+            rrect(host, b, [br[0] + 1.0, br[1] + 1.0, br[2] - 2.0, br[3] - 2.0], 4.0, argb(0x1A_1F_22));
+            host.text(b, text, [bx + 5.0, r[1] + 3.0], OWN, false);
+            st.badges.push((br, sid.clone()));
+        }
         host.text(b, &fit(host, &detail, c.name[2]), [c.name[0], r[1] + 12.0], FAINT, false);
 
         let when = ui::when_text(row, &code);
@@ -1131,6 +1228,21 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
                 rrect(host, b, [c.reset[0] - 1.0, r[1] + 3.0, 16.0, r[3] - 6.0], 3.0, ROW_HOVER);
             }
             icon(host, b, Icon::Reset, Tone::Own, [c.reset[0] + 1.0, c.reset[1], ICON_SIZE, c.reset[3]]);
+        }
+        if let Key::Sound(sid) = &row.key {
+            let timer_hover = hover && ui::contains(c.timer, mouse);
+            if timer_hover {
+                rrect(host, b, [c.timer[0] - 1.0, r[1] + 3.0, 16.0, r[3] - 6.0], 3.0, ROW_HOVER);
+            }
+            let open = st.list.drawer.as_deref() == Some(sid.as_str());
+            let tone = if row.cooldown > 0 {
+                Tone::Own
+            } else if open || timer_hover {
+                Tone::Text
+            } else {
+                Tone::Faint
+            };
+            icon(host, b, Icon::Timer, tone, [c.timer[0] + 1.0, c.timer[1], ICON_SIZE, c.timer[3]]);
         }
     }
     dump_rows(st, &rows, &lay, now);
