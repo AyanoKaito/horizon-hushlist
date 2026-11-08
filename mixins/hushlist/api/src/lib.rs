@@ -752,6 +752,7 @@ impl State {
             low: by - zn::HEIGHT_HALF,
             high: by + zn::HEIGHT_HALF,
             far: false,
+            points: Vec::new(),
         });
         self.list.search_focus = false;
     }
@@ -770,14 +771,23 @@ impl State {
             low: z.low,
             high: z.high,
             far: z.r > 28,
+            points: z.points.clone(),
         });
         self.list.tab = Tab::Zones;
         self.list.search_focus = false;
     }
 
     fn save_editor(&mut self, now: Instant) {
-        let Some(e) = self.editor.take() else { return };
+        if self.editor.as_ref().is_none_or(|e| !e.complete()) {
+            return;
+        }
+        let Some(mut e) = self.editor.take() else { return };
         let Some(world) = self.engine.world.clone() else { return };
+        if e.shape == Shape::Points {
+            (e.x, e.z, e.r) = zn::polygon_centre(&e.points);
+        } else {
+            e.points.clear();
+        }
         let mut name = profiles::clean_name(&e.name);
         if name.is_empty() {
             name = i18n::with_n(&lang::code(), "zones.new_name", self.world_zones().len() + 1);
@@ -786,11 +796,25 @@ impl State {
             Some(i) => {
                 let z = &mut self.engine.zones[i];
                 (z.name, z.shape, z.x, z.z, z.r, z.low, z.high) = (name, e.shape, e.x, e.z, e.r, e.low, e.high);
+                z.points = e.points;
+                z.area_cache = Default::default();
                 z.id
             }
             None => {
                 let id = zn::next_id(&self.engine.zones);
-                let zone = Zone { id, world, name, shape: e.shape, x: e.x, z: e.z, r: e.r, low: e.low, high: e.high, settings: Settings::default() };
+                let zone = Zone {
+                    id,
+                    world,
+                    name,
+                    shape: e.shape,
+                    x: e.x,
+                    z: e.z,
+                    r: e.r,
+                    low: e.low,
+                    high: e.high,
+                    points: e.points,
+                    ..Zone::default()
+                };
                 self.engine.zones.push(zone);
                 id
             }
@@ -820,6 +844,8 @@ impl State {
             new_zone: w("zones.new"),
             circle: w("zones.circle"),
             square: w("zones.square"),
+            points: w("zones.points"),
+            clear: w("zones.clear"),
             near: w("zones.near"),
             far: w("zones.far"),
             save: w("zones.save"),
@@ -846,7 +872,8 @@ impl State {
         let m = self.zone_measure(host);
         if self.editor.is_some() {
             let el = zn::editor_layout(area, &m);
-            let hit = zn::editor_hit(&el, mouse);
+            let points_mode = self.editor.as_ref().is_some_and(|e| e.shape == Shape::Points);
+            let hit = zn::editor_hit(&el, mouse, points_mode);
             match hit {
                 EditorHit::Save => return self.save_editor(now),
                 EditorHit::Cancel => return self.cancel_editor(),
@@ -858,8 +885,17 @@ impl State {
             let Some(e) = self.editor.as_mut() else { return };
             e.typing = hit == EditorHit::Name;
             match hit {
-                EditorHit::Circle => e.shape = Shape::Circle,
-                EditorHit::Square => e.shape = Shape::Square,
+                EditorHit::Circle => {
+                    e.shape = Shape::Circle;
+                    e.points.clear();
+                }
+                EditorHit::Square => {
+                    e.shape = Shape::Square;
+                    e.points.clear();
+                }
+                EditorHit::Points => e.shape = Shape::Points,
+                EditorHit::Clear => e.points.clear(),
+                EditorHit::Map => e.click_map(el.map, mouse),
                 EditorHit::Near => e.far = false,
                 EditorHit::Far => e.far = true,
                 EditorHit::Slider => e.r = zn::slider_radius(el.slider, mouse[0]),
@@ -909,7 +945,7 @@ impl State {
             .map(|(i, z)| (z, zn::color(i)))
             .collect();
         let other_key: Vec<String> = others.iter().map(|(z, c)| format!("{}:{:?}:{}:{}:{}:{c}", z.id, z.shape, z.x, z.z, z.r)).collect();
-        let ikey = format!("{origin:?}|{span}|{:?}|{}|{}|{}|{}", e.shape, e.x, e.z, e.r, other_key.join(","));
+        let ikey = format!("{origin:?}|{span}|{:?}|{}|{}|{}|{:?}|{}", e.shape, e.x, e.z, e.r, e.points, other_key.join(","));
         if self.map.image_key.as_ref() == Some(&ikey) {
             return;
         }
@@ -923,7 +959,7 @@ impl State {
                 if let Some((_, col)) = others.iter().find(|(z, _)| z.holds_column(bx, bz)) {
                     c = mix_rgb(c, *col, 0.33);
                 }
-                let inside = zn::inside(e.shape, e.r, bx - e.x, bz - e.z);
+                let inside = e.holds_column(bx, bz);
                 let fill = if inside { mix_rgb(c, OWN, 0.42) } else { c };
                 // Every block of the zone is outlined, so the player can count them.
                 let edge = if inside && cell >= 5 { mix_rgb(c, OWN, 0.75) } else { fill };
@@ -2164,13 +2200,14 @@ fn draw_zone_head(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::L
 }
 
 /// A zone's one-line description: shape and size, area, height.
-fn zone_meta(code: &str, shape: Shape, r: i32, low: i32, high: i32) -> String {
-    let shape_text = match shape {
-        Shape::Circle => i18n::with_n(code, "zones.meta_circle", r),
-        Shape::Square => i18n::with_n(code, "zones.meta_square", 2 * r + 1),
+fn zone_meta(code: &str, z: &Zone) -> String {
+    let shape_text = match z.shape {
+        Shape::Circle => i18n::with_n(code, "zones.meta_circle", z.r),
+        Shape::Square => i18n::with_n(code, "zones.meta_square", 2 * z.r + 1),
+        Shape::Points => i18n::with_n(code, "zones.meta_points", z.points.len()),
     };
-    let area = i18n::with_n(code, "zones.meta_area", zn::area(shape, r));
-    let height = i18n::text(code, "zones.meta_height").replace("{list}", &format!("{low}–{high}"));
+    let area = i18n::with_n(code, "zones.meta_area", z.area());
+    let height = i18n::text(code, "zones.meta_height").replace("{list}", &format!("{}–{}", z.low, z.high));
     format!("{shape_text} · {area} · {height}")
 }
 
@@ -2203,6 +2240,17 @@ fn draw_zones(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
                 host.fill(b, [mx - 2.0, my - 2.0, 4.0, 4.0], argb(AMBER));
             }
         }
+        // Corners placed on the map: white squares on the block corners.
+        let o = e.origin();
+        let cell = map[2] / e.span() as f32;
+        for pt in &e.points {
+            let px = map[0] + (pt[0] - o[0]) as f32 * cell;
+            let py = map[1] + (pt[1] - o[1]) as f32 * cell;
+            if ui::contains([map[0] - 1.0, map[1] - 1.0, map[2] + 2.0, map[3] + 2.0], [px, py]) {
+                host.fill(b, [px - 3.0, py - 3.0, 6.0, 6.0], argb(0x17_15_1E));
+                host.fill(b, [px - 2.0, py - 2.0, 4.0, 4.0], argb(0xFF_FF_FF));
+            }
+        }
         let title = tr(if e.id.is_some() { "zones.title_edit" } else { "zones.title_new" });
         host.text(b, title, el.title_at, TEXT, false);
         host.text(b, tr("zones.name"), el.name_label_at, DIM, false);
@@ -2219,36 +2267,60 @@ fn draw_zones(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
         if e.typing && (now_ms / 530) % 2 == 0 {
             host.fill(b, [f[0] + 6.0 + host.text_width(shown), f[1] + 4.0, 1.0, 8.0], argb(TEXT));
         }
-        let seg = |host: &dyn Host, b: &mut HudBatch, a: Rect, c: Rect, la: &str, lc: &str, first: bool| {
-            let whole = [a[0], a[1], c[0] + c[2] - a[0], a[3]];
+        // A row of joined buttons, one of them on.
+        let seg = |host: &dyn Host, b: &mut HudBatch, parts: &[(Rect, &str)], on: usize| {
+            let (first, last) = (parts[0].0, parts[parts.len() - 1].0);
+            let whole = [first[0], first[1], last[0] + last[2] - first[0], first[3]];
             rrect(host, b, whole, 3.0, EDGE);
             rrect(host, b, [whole[0] + 1.0, whole[1] + 1.0, whole[2] - 2.0, whole[3] - 2.0], 2.0, argb(0x16_15_1B));
-            let on = if first { a } else { c };
-            rrect(host, b, [on[0] + 1.0, on[1] + 1.0, on[2] - 2.0, on[3] - 2.0], 2.0, 0x30_FF_FF_FF);
-            for (r, l, active) in [(a, la, first), (c, lc, !first)] {
-                let rgb = if active || ui::contains(r, mouse) { TEXT } else { DIM };
+            let r = parts[on].0;
+            rrect(host, b, [r[0] + 1.0, r[1] + 1.0, r[2] - 2.0, r[3] - 2.0], 2.0, 0x30_FF_FF_FF);
+            for (k, (r, l)) in parts.iter().enumerate() {
+                let rgb = if k == on || ui::contains(*r, mouse) { TEXT } else { DIM };
                 host.text(b, l, [r[0] + (r[2] - host.text_width(l)) / 2.0, r[1] + 4.0], rgb, false);
             }
         };
-        seg(host, b, el.circle, el.square, tr("zones.circle"), tr("zones.square"), e.shape == Shape::Circle);
-        host.text(b, tr("zones.scale"), el.zoom_label_at, DIM, false);
-        seg(host, b, el.near, el.far, tr("zones.near"), tr("zones.far"), !e.far);
-        let size = match e.shape {
-            Shape::Circle => i18n::with_n(&code, "zones.radius", e.r),
-            Shape::Square => tr("zones.side").replace("{list}", &format!("{0}×{0}", 2 * e.r + 1)),
+        let shape_on = match e.shape {
+            Shape::Circle => 0,
+            Shape::Square => 1,
+            Shape::Points => 2,
         };
-        host.text(b, &size, el.radius_label_at, TEXT, false);
-        let s = el.slider;
-        let cy = (s[1] + s[3] / 2.0).floor();
-        rrect(host, b, [s[0] + 2.0, cy - 1.5, s[2] - 4.0, 3.0], 1.5, TRACK);
-        let tx = zn::slider_pos(s, e.r);
-        rrect(host, b, [s[0] + 2.0, cy - 1.5, tx - s[0] - 2.0, 3.0], 1.5, argb(OWN));
-        let grow = if st.zone_drag || ui::contains(s, mouse) { 1.0 } else { 0.0 };
-        rrect(host, b, [tx - 2.5 - grow * 0.5, cy - 5.0 - grow, 5.0 + grow, 10.0 + grow * 2.0], 2.5, THUMB);
+        let shapes = [(el.circle, tr("zones.circle")), (el.square, tr("zones.square")), (el.points, tr("zones.points"))];
+        seg(host, b, &shapes, shape_on);
+        host.text(b, tr("zones.scale"), el.zoom_label_at, DIM, false);
+        seg(host, b, &[(el.near, tr("zones.near")), (el.far, tr("zones.far"))], usize::from(e.far));
+        let form_room = area[0] + area[2] - el.form_x;
+        if e.shape == Shape::Points {
+            host.text(b, &fit(host, tr("zones.points_hint"), form_room), el.radius_label_at, TEXT, false);
+            let c = el.clear;
+            let any = !e.points.is_empty();
+            button(host, b, c, tr("zones.clear"), if any { TEXT } else { FAINT }, EDGE, any && ui::contains(c, mouse));
+        } else {
+            let size = match e.shape {
+                Shape::Square => tr("zones.side").replace("{list}", &format!("{0}×{0}", 2 * e.r + 1)),
+                _ => i18n::with_n(&code, "zones.radius", e.r),
+            };
+            host.text(b, &size, el.radius_label_at, TEXT, false);
+            let s = el.slider;
+            let cy = (s[1] + s[3] / 2.0).floor();
+            rrect(host, b, [s[0] + 2.0, cy - 1.5, s[2] - 4.0, 3.0], 1.5, TRACK);
+            let tx = zn::slider_pos(s, e.r);
+            rrect(host, b, [s[0] + 2.0, cy - 1.5, tx - s[0] - 2.0, 3.0], 1.5, argb(OWN));
+            let grow = if st.zone_drag || ui::contains(s, mouse) { 1.0 } else { 0.0 };
+            rrect(host, b, [tx - 2.5 - grow * 0.5, cy - 5.0 - grow, 5.0 + grow, 10.0 + grow * 2.0], 2.5, THUMB);
+        }
         let height = tr("zones.height").replace("{list}", &format!("{}–{}", e.low, e.high));
-        host.text(b, &fit(host, &height, area[0] + area[2] - el.form_x), el.height_at, DIM, false);
-        host.text(b, &i18n::with_n(&code, "zones.area", e.area()), el.area_at, DIM, false);
-        button(host, b, el.save, tr("zones.save"), OWN, 0xC0_6F_F0_DA, ui::contains(el.save, mouse));
+        host.text(b, &fit(host, &height, form_room), el.height_at, DIM, false);
+        if e.complete() {
+            host.text(b, &i18n::with_n(&code, "zones.area", e.area()), el.area_at, DIM, false);
+        } else {
+            host.text(b, tr("zones.min3"), el.area_at, AMBER, false);
+        }
+        if e.complete() {
+            button(host, b, el.save, tr("zones.save"), OWN, 0xC0_6F_F0_DA, ui::contains(el.save, mouse));
+        } else {
+            button(host, b, el.save, tr("zones.save"), FAINT, EDGE, false);
+        }
         button(host, b, el.cancel, tr("button.cancel"), TEXT, EDGE, ui::contains(el.cancel, mouse));
         dump_zones(st, None, Some(&el), now_ms);
         return;
@@ -2301,7 +2373,7 @@ fn draw_zones(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
         host.text(b, &changed, [right - host.text_width(&changed), r[1] + 18.0], FAINT, false);
         let room = right - sw.max(host.text_width(&changed)) - 12.0 - (r[0] + 28.0);
         host.text(b, &fit(host, &z.name, room), [r[0] + 28.0, r[1] + 6.0], TEXT, false);
-        host.text(b, &fit(host, &zone_meta(&code, z.shape, z.r, z.low, z.high), room), [r[0] + 28.0, r[1] + 18.0], FAINT, false);
+        host.text(b, &fit(host, &zone_meta(&code, &z), room), [r[0] + 28.0, r[1] + 18.0], FAINT, false);
     }
     dump_zones(st, Some(&ll), None, now_ms);
 }
@@ -2335,8 +2407,9 @@ fn dump_zones(st: &mut State, list: Option<&zn::ListLayout>, editor: Option<&zn:
     if let (Some(el), Some(e)) = (editor, st.editor.as_ref()) {
         let ready = st.map.uploaded_key.is_some() && st.map.uploaded_key == st.map.image_key;
         layout.push_str(&format!(
-            ",\"editor\":true,\"e_name\":{:?},\"e_typing\":{},\"e_shape\":\"{:?}\",\"e_r\":{},\"e_far\":{},\"e_area\":{},\"map_ready\":{},\"map\":{},\"e_field\":{},\"e_circle\":{},\"e_square\":{},\"e_near\":{},\"e_far_btn\":{},\"e_slider\":{},\"e_save\":{},\"e_cancel\":{}",
-            e.name, e.typing, e.shape, e.r, e.far, e.area(), ready, r(el.map), r(el.name), r(el.circle), r(el.square), r(el.near), r(el.far), r(el.slider), r(el.save), r(el.cancel)
+            ",\"editor\":true,\"e_name\":{:?},\"e_typing\":{},\"e_shape\":\"{:?}\",\"e_r\":{},\"e_far\":{},\"e_area\":{},\"map_ready\":{},\"map\":{},\"e_field\":{},\"e_circle\":{},\"e_square\":{},\"e_near\":{},\"e_far_btn\":{},\"e_slider\":{},\"e_save\":{},\"e_cancel\":{},\"e_points_btn\":{},\"e_clear\":{},\"e_points\":{:?},\"e_x\":{},\"e_z\":{},\"e_span\":{},\"e_complete\":{}",
+            e.name, e.typing, e.shape, e.r, e.far, e.area(), ready, r(el.map), r(el.name), r(el.circle), r(el.square), r(el.near), r(el.far), r(el.slider), r(el.save), r(el.cancel),
+            r(el.points), r(el.clear), e.points, e.x, e.z, e.span(), e.complete()
         ));
     }
     let mut path = std::path::PathBuf::from(trace);

@@ -2,6 +2,16 @@
 
 Dated record of what was checked and what it proved. Each entry separates what was confirmed from what was not.
 
+## 2026-11-08 — Zones, part 2 (points)
+
+**Pin:** Horizon Nightly `6560641ba51a452f6bc2407baa4eb1b3be517ca8`.
+
+**Change:** the zone editor has a third shape, Points. Each click on the map places a corner on the block grid (a click on a corner removes it), up to 10; "Clear points" removes them all. A block is in the zone when its middle is inside the polygon. The zone can be saved from 3 corners.
+
+**Confirmed** (isolated offscreen runs, English and Russian, standard test meadow): four corners clicked around the player made an 8 by 8 block zone (64 blocks); two corners alone could not be saved; a second click on a corner removed it; the zone file kept the four corners; chickens inside the zone played at volume 0 after muting, chickens 11 to 13 blocks away at full volume. The circle checks still pass.
+
+**Not confirmed:** self-crossing polygons (they follow the even-odd rule); corners outside the map's view after switching the scale.
+
 ## 2026-11-08 — Zones, part 1 (circle and square)
 
 **Pin:** Horizon Nightly `6560641ba51a452f6bc2407baa4eb1b3be517ca8`.

@@ -8,8 +8,9 @@
 //! one wins.
 //!
 //! File: `profiles/<profile>.zones.txt`, one block per zone:
-//! `zone <id>`, `world <key>`, `name <name>`, `shape <circle|square> <x> <z> <r>`,
-//! `height <low> <high>`, the zone's settings lines, `end`.
+//! `zone <id>`, `world <key>`, `name <name>`, `shape <circle|square|points> <x> <z> <r>`,
+//! `point <x> <z>` lines for a zone drawn by points (block corners), `height <low> <high>`,
+//! the zone's settings lines, `end`.
 
 use crate::core::Settings;
 use crate::ui::{Rect, contains};
@@ -21,6 +22,8 @@ pub const RADIUS_MAX: i32 = 64;
 pub const RADIUS_MIN: i32 = 2;
 /// Height above and below the player when a zone is made.
 pub const HEIGHT_HALF: i32 = 8;
+/// Most corners of a zone drawn by points.
+pub const POINTS_MAX: usize = 10;
 /// Zone colours, by the zone's place in the profile.
 pub const COLORS: [u32; 5] = [0x6F_F0_DA, 0xF5_B1_42, 0xB7_9C_FF, 0xFF_8A_7A, 0x7F_C8_FF];
 
@@ -29,6 +32,8 @@ pub enum Shape {
     #[default]
     Circle,
     Square,
+    /// A polygon through corners the player clicked on the map.
+    Points,
 }
 
 impl Shape {
@@ -36,6 +41,7 @@ impl Shape {
         match self {
             Shape::Circle => "circle",
             Shape::Square => "square",
+            Shape::Points => "points",
         }
     }
 }
@@ -54,22 +60,81 @@ pub struct Zone {
     /// Lowest and highest block y, both inside.
     pub low: i32,
     pub high: i32,
+    /// Corners (block corner coordinates) of a zone drawn by points.
+    pub points: Vec<[i32; 2]>,
     pub settings: Settings,
+    /// Block columns inside, counted once (the smallest zone wins on every sound start).
+    pub area_cache: std::cell::OnceCell<u32>,
 }
 
-/// Whether block column `(dx, dz)` from the centre is inside a shape of radius `r`.
+/// Whether block column `(dx, dz)` from the centre is inside a circle or square of radius `r`.
 pub fn inside(shape: Shape, r: i32, dx: i32, dz: i32) -> bool {
     match shape {
         // A little more than the exact circle, so a radius-r circle reaches r blocks along each axis
         // and its edge looks round in blocks.
         Shape::Circle => (dx * dx + dz * dz) as f32 <= (r * r) as f32 + r as f32 * 0.6,
         Shape::Square => dx.abs() <= r && dz.abs() <= r,
+        Shape::Points => false,
     }
+}
+
+/// Whether block column `(bx, bz)` (its middle) is inside the polygon through `points`.
+pub fn in_polygon(points: &[[i32; 2]], bx: i32, bz: i32) -> bool {
+    if points.len() < 3 {
+        return false;
+    }
+    let (px, pz) = (f64::from(bx) + 0.5, f64::from(bz) + 0.5);
+    let mut inside = false;
+    let mut j = points.len() - 1;
+    for i in 0..points.len() {
+        let (xi, zi) = (f64::from(points[i][0]), f64::from(points[i][1]));
+        let (xj, zj) = (f64::from(points[j][0]), f64::from(points[j][1]));
+        if (zi > pz) != (zj > pz) && px < (xj - xi) * (pz - zi) / (zj - zi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Columns a polygon can cover: `[min x, min z, max x, max z]`, max excluded.
+fn bounds(points: &[[i32; 2]]) -> [i32; 4] {
+    let mut b = [i32::MAX, i32::MAX, i32::MIN, i32::MIN];
+    for p in points {
+        b = [b[0].min(p[0]), b[1].min(p[1]), b[2].max(p[0]), b[3].max(p[1])];
+    }
+    b
+}
+
+pub fn polygon_area(points: &[[i32; 2]]) -> u32 {
+    if points.len() < 3 {
+        return 0;
+    }
+    let b = bounds(points);
+    let mut n = 0;
+    for bz in b[1]..b[3] {
+        for bx in b[0]..b[2] {
+            if in_polygon(points, bx, bz) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Centre column and the radius that covers a polygon, for distances and the editor's map.
+pub fn polygon_centre(points: &[[i32; 2]]) -> (i32, i32, i32) {
+    let b = bounds(points);
+    let r = ((b[2] - b[0]).max(b[3] - b[1]) + 1) / 2;
+    ((b[0] + b[2]).div_euclid(2), (b[1] + b[3]).div_euclid(2), r.max(1))
 }
 
 impl Zone {
     pub fn holds_column(&self, bx: i32, bz: i32) -> bool {
-        inside(self.shape, self.r, bx - self.x, bz - self.z)
+        match self.shape {
+            Shape::Points => in_polygon(&self.points, bx, bz),
+            _ => inside(self.shape, self.r, bx - self.x, bz - self.z),
+        }
     }
 
     /// Whether a sound at `pos` (world coordinates) comes from this zone.
@@ -83,7 +148,10 @@ impl Zone {
 
     /// Block columns inside.
     pub fn area(&self) -> u32 {
-        area(self.shape, self.r)
+        *self.area_cache.get_or_init(|| match self.shape {
+            Shape::Points => polygon_area(&self.points),
+            _ => area(self.shape, self.r),
+        })
     }
 
     /// Horizontal distance in whole blocks from a point to the centre.
@@ -138,7 +206,8 @@ pub fn parse(text: &str) -> Vec<Zone> {
         if line == "end" {
             let (mut zone, body) = cur.take().unwrap_or_default();
             zone.settings = Settings::parse(&body);
-            if !zone.world.is_empty() && zone.r >= 1 && zone.low <= zone.high && !out.iter().any(|z: &Zone| z.id == zone.id) {
+            let shape_ok = zone.shape != Shape::Points || (3..=POINTS_MAX).contains(&zone.points.len());
+            if shape_ok && !zone.world.is_empty() && zone.r >= 1 && zone.low <= zone.high && !out.iter().any(|z: &Zone| z.id == zone.id) {
                 zone.r = zone.r.min(RADIUS_MAX);
                 out.push(zone);
             }
@@ -149,10 +218,19 @@ pub fn parse(text: &str) -> Vec<Zone> {
         } else if let Some(s) = line.strip_prefix("shape ") {
             let f: Vec<&str> = s.split_whitespace().collect();
             if let [kind, x, z, r] = f[..] {
-                zone.shape = if kind == "square" { Shape::Square } else { Shape::Circle };
+                zone.shape = match kind {
+                    "square" => Shape::Square,
+                    "points" => Shape::Points,
+                    _ => Shape::Circle,
+                };
                 zone.x = x.parse().unwrap_or(0);
                 zone.z = z.parse().unwrap_or(0);
                 zone.r = r.parse().unwrap_or(0);
+            }
+        } else if let Some(pt) = line.strip_prefix("point ") {
+            let f: Vec<i32> = pt.split_whitespace().filter_map(|v| v.parse().ok()).collect();
+            if let [x, z] = f[..] {
+                zone.points.push([x, z]);
             }
         } else if let Some(h) = line.strip_prefix("height ") {
             let f: Vec<i32> = h.split_whitespace().filter_map(|v| v.parse().ok()).collect();
@@ -175,6 +253,11 @@ pub fn to_text(zones: &[Zone]) -> String {
             "zone {}\nworld {}\nname {}\nshape {} {} {} {}\nheight {} {}\n",
             z.id, z.world, z.name, z.shape.word(), z.x, z.z, z.r, z.low, z.high
         ));
+        if z.shape == Shape::Points {
+            for p in &z.points {
+                out.push_str(&format!("point {} {}\n", p[0], p[1]));
+            }
+        }
         for line in z.settings.to_text().lines().filter(|l| !l.starts_with('#')) {
             out.push_str(line);
             out.push('\n');
@@ -206,6 +289,8 @@ pub struct Editor {
     pub high: i32,
     /// Map scale: 64 by 64 blocks when near, 128 by 128 when far.
     pub far: bool,
+    /// Corners placed on the map (shape Points).
+    pub points: Vec<[i32; 2]>,
 }
 
 impl Editor {
@@ -213,7 +298,40 @@ impl Editor {
         if self.far { 128 } else { 64 }
     }
     pub fn area(&self) -> u32 {
-        area(self.shape, self.r)
+        match self.shape {
+            Shape::Points => polygon_area(&self.points),
+            _ => area(self.shape, self.r),
+        }
+    }
+    pub fn holds_column(&self, bx: i32, bz: i32) -> bool {
+        match self.shape {
+            Shape::Points => in_polygon(&self.points, bx, bz),
+            _ => inside(self.shape, self.r, bx - self.x, bz - self.z),
+        }
+    }
+    /// The zone can be saved: a polygon needs three corners.
+    pub fn complete(&self) -> bool {
+        self.shape != Shape::Points || self.points.len() >= 3
+    }
+    /// The map's north-west column.
+    pub fn origin(&self) -> [i32; 2] {
+        [self.x - self.span() / 2, self.z - self.span() / 2]
+    }
+    /// A click on the map at `at` (GUI pixels) in `map`: adds a corner there, or removes the corner
+    /// already there. Ignored for other shapes and past [`POINTS_MAX`].
+    pub fn click_map(&mut self, map: Rect, at: [f32; 2]) {
+        if self.shape != Shape::Points || !contains(map, at) {
+            return;
+        }
+        let span = self.span() as f32;
+        let o = self.origin();
+        let cx = o[0] + ((at[0] - map[0]) / map[2] * span).round() as i32;
+        let cz = o[1] + ((at[1] - map[1]) / map[3] * span).round() as i32;
+        if let Some(i) = self.points.iter().position(|p| p[0] == cx && p[1] == cz) {
+            self.points.remove(i);
+        } else if self.points.len() < POINTS_MAX {
+            self.points.push([cx, cz]);
+        }
     }
 }
 
@@ -223,6 +341,8 @@ pub struct Measure {
     pub new_zone: f32,
     pub circle: f32,
     pub square: f32,
+    pub points: f32,
+    pub clear: f32,
     pub near: f32,
     pub far: f32,
     pub save: f32,
@@ -275,6 +395,9 @@ pub struct EditorLayout {
     pub name: Rect,
     pub circle: Rect,
     pub square: Rect,
+    pub points: Rect,
+    /// "Clear points", where the radius slider is for the other shapes.
+    pub clear: Rect,
     pub zoom_label_at: [f32; 2],
     pub near: Rect,
     pub far: Rect,
@@ -298,6 +421,10 @@ pub fn editor_layout(area: Rect, m: &Measure) -> EditorLayout {
         let r2 = [at + a + 16.0, top, b + 16.0, 16.0];
         (r1, r2)
     };
+    let seg3 = |at: f32, top: f32, a: f32, b: f32, c: f32| -> (Rect, Rect, Rect) {
+        let (r1, r2) = seg(at, top, a, b);
+        (r1, r2, [r2[0] + r2[2], top, c + 16.0, 16.0])
+    };
     let mut cy = y + 2.0;
     let title_at = [fx, cy];
     cy += 16.0;
@@ -305,7 +432,7 @@ pub fn editor_layout(area: Rect, m: &Measure) -> EditorLayout {
     cy += 11.0;
     let name = [fx, cy, fw.min(220.0), 16.0];
     cy += 24.0;
-    let (circle, square) = seg(fx, cy, m.circle, m.square);
+    let (circle, square, points) = seg3(fx, cy, m.circle, m.square, m.points);
     cy += 26.0;
     let zoom_label_at = [fx, cy];
     cy += 11.0;
@@ -314,6 +441,7 @@ pub fn editor_layout(area: Rect, m: &Measure) -> EditorLayout {
     let radius_label_at = [fx, cy];
     cy += 12.0;
     let slider = [fx, cy, fw.min(220.0), 12.0];
+    let clear = [fx, cy - 2.0, m.clear + 16.0, 16.0];
     cy += 22.0;
     let height_at = [fx, cy];
     cy += 13.0;
@@ -329,6 +457,8 @@ pub fn editor_layout(area: Rect, m: &Measure) -> EditorLayout {
         name,
         circle,
         square,
+        points,
+        clear,
         zoom_label_at,
         near,
         far,
@@ -357,6 +487,9 @@ pub enum EditorHit {
     Name,
     Circle,
     Square,
+    Points,
+    Clear,
+    Map,
     Near,
     Far,
     Slider,
@@ -365,12 +498,18 @@ pub enum EditorHit {
     Nothing,
 }
 
-pub fn editor_hit(lay: &EditorLayout, at: [f32; 2]) -> EditorHit {
+/// `points`: the editor draws a polygon, so the slider's place holds "Clear points".
+pub fn editor_hit(lay: &EditorLayout, at: [f32; 2], points: bool) -> EditorHit {
     let slider = [lay.slider[0] - 2.0, lay.slider[1] - 3.0, lay.slider[2] + 4.0, lay.slider[3] + 6.0];
+    let none = [0.0; 4];
+    let (slider, clear) = if points { (none, lay.clear) } else { (slider, none) };
     [
+        (lay.map, EditorHit::Map),
         (lay.name, EditorHit::Name),
         (lay.circle, EditorHit::Circle),
         (lay.square, EditorHit::Square),
+        (lay.points, EditorHit::Points),
+        (clear, EditorHit::Clear),
         (lay.near, EditorHit::Near),
         (lay.far, EditorHit::Far),
         (slider, EditorHit::Slider),
@@ -466,7 +605,8 @@ mod tests {
         a.settings.groups.insert("entity.chicken".into(), 0);
         a.settings.sounds.insert("entity.cow.ambient".into(), 30);
         let b = Zone { id: 4, world: "server:mc.example.com:25565".into(), name: "Store room".into(), ..zone(Shape::Square, 3, 3, 4) };
-        let zones = vec![a, b];
+        let c = Zone { id: 5, points: vec![[0, 0], [5, 0], [5, 3]], ..zone(Shape::Points, 3, 1, 3) };
+        let zones = vec![a, b, c];
         assert_eq!(parse(&to_text(&zones)), zones);
     }
 
@@ -547,9 +687,48 @@ mod tests {
         assert_eq!(slider_radius(s, 0.0), RADIUS_MIN);
         assert_eq!(slider_radius(s, 1000.0), RADIUS_MAX);
         assert_eq!(slider_radius(s, slider_pos(s, 20)), 20);
-        let lay = editor_layout([0.0, 0.0, 600.0, 270.0], &Measure { circle: 30.0, square: 40.0, near: 30.0, far: 30.0, save: 50.0, cancel: 40.0, new_zone: 0.0 });
+        let m = Measure { circle: 30.0, square: 40.0, points: 30.0, clear: 50.0, near: 30.0, far: 30.0, save: 50.0, cancel: 40.0, new_zone: 0.0 };
+        let lay = editor_layout([0.0, 0.0, 600.0, 270.0], &m);
         assert_eq!(lay.map[2], 256.0);
         assert!(lay.save[0] + lay.save[2] < lay.cancel[0]);
-        assert_eq!(editor_hit(&lay, [lay.square[0] + 3.0, lay.square[1] + 3.0]), EditorHit::Square);
+        assert_eq!(editor_hit(&lay, [lay.square[0] + 3.0, lay.square[1] + 3.0], false), EditorHit::Square);
+        assert_eq!(editor_hit(&lay, [lay.points[0] + 3.0, lay.points[1] + 3.0], false), EditorHit::Points);
+        assert_eq!(editor_hit(&lay, [lay.clear[0] + 3.0, lay.clear[1] + 8.0], true), EditorHit::Clear);
+        assert_eq!(editor_hit(&lay, [lay.map[0] + 10.0, lay.map[1] + 10.0], true), EditorHit::Map);
+    }
+
+    #[test]
+    fn a_polygon_holds_the_blocks_whose_middles_are_inside() {
+        // Corners of an 8 by 8 block square from (-4,-4) to (4,4): columns -4..=3.
+        let pts = vec![[-4, -4], [4, -4], [4, 4], [-4, 4]];
+        assert_eq!(polygon_area(&pts), 64);
+        assert!(in_polygon(&pts, -4, -4) && in_polygon(&pts, 3, 3));
+        assert!(!in_polygon(&pts, 4, 0) && !in_polygon(&pts, 0, -5));
+        let tri = vec![[0, 0], [6, 0], [0, 6]];
+        assert!(in_polygon(&tri, 0, 0) && !in_polygon(&tri, 5, 5));
+        assert_eq!(polygon_centre(&pts), (0, 0, 4));
+        let z = Zone { points: pts, ..zone(Shape::Points, 0, 0, 4) };
+        assert_eq!(z.area(), 64);
+        assert!(z.holds([3.9, 64.0, -3.9]) && !z.holds([4.1, 64.0, 0.0]));
+    }
+
+    #[test]
+    fn map_clicks_add_and_remove_corners() {
+        let mut e = Editor { id: None, name: String::new(), typing: false, shape: Shape::Points, x: 100, z: 50, r: 8, low: 0, high: 10, far: false, points: Vec::new() };
+        let map = [0.0, 0.0, 256.0, 256.0];
+        // 4 px a block when near: the middle of the map is the corner (100, 50).
+        e.click_map(map, [128.0, 128.0]);
+        assert_eq!(e.points, vec![[100, 50]]);
+        e.click_map(map, [129.0, 127.0]);
+        assert!(e.points.is_empty(), "a click on a corner removes it");
+        assert!(!e.complete());
+        for i in 0..12 {
+            e.click_map(map, [10.0 + i as f32 * 8.0, 20.0]);
+        }
+        assert_eq!(e.points.len(), POINTS_MAX);
+        assert!(e.complete());
+        e.shape = Shape::Circle;
+        e.click_map(map, [200.0, 200.0]);
+        assert_eq!(e.points.len(), POINTS_MAX);
     }
 }
