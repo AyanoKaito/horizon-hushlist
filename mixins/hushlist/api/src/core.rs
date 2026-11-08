@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 pub const MOD_ID: &str = "hushlist";
-pub const MOD_VERSION: &str = "0.2.0";
+pub const MOD_VERSION: &str = "0.3.0";
 pub const SETTINGS_FILE: &str = "settings.txt";
 /// Sounds stay in the recent list this long after they last played.
 pub const RECENT_WINDOW: Duration = Duration::from_secs(300);

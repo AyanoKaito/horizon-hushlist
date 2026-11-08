@@ -6,23 +6,26 @@ Hushlist is a native mod for [Horizon](https://playhorizon.dev), a reimplementat
 
 ## Status
 
-**Early development. There is nothing to install yet.**
+**In development. There is nothing to install yet.**
 
-The project started on 6 November 2026. Version 0.2.0 runs in a local build of the game: press H to open a screen that lists the sounds you heard recently, with a volume slider, mute and reset for each sound and each group, in English and Russian. It is not packaged for installation yet; see the [research log](docs/research/log.md). Current work:
+The project started on 6 November 2026. Version 0.3.0 runs in a local build of the game, in English and Russian. Press H to open a screen with the sounds you heard recently, every sound of the game, and the ones you changed: each sound and each group has a volume slider, mute, reset and an optional pause between plays. Search, category filters and a flat or grouped view help find a sound. Settings live in profiles you can switch, and zones give a place in the world its own volumes. Multiplayer, servers and performance are not checked yet, and it is not packaged for installation; see the [research log](docs/research/log.md). Current work:
 
 - player scenarios and the scope of the first version: [docs/concept.md](docs/concept.md);
 - decisions made so far: [docs/decisions.md](docs/decisions.md);
 - how sound works in Horizon and where the mod can hook in: [docs/research/horizon-audio.md](docs/research/horizon-audio.md);
 - dated research log: [docs/research/log.md](docs/research/log.md).
 
-## Planned idea
+## Features
 
 - A live list of the sounds you are hearing right now and heard recently, so you can find an annoying sound without knowing its technical ID.
-- A search field that filters the list while sounds keep highlighting as they play.
-- A volume slider from 0 to 100% for each sound, plus mute and reset.
-- Settings saved between sessions.
+- Every sound of the game, and a list of the ones you changed.
+- A volume from 0 to 100% for each sound and each group, plus mute, reset and a pause between plays.
+- Search, category filters and a flat or grouped view.
+- Profiles: named sets of settings, one active at a time.
+- Zones: a place in the world (a circle, a square or a shape you draw on a map) whose sounds get their own volumes, with an optional see-through border in the world.
+- Settings saved between sessions; the text follows the game's language.
 
-Details are not final and are discussed in [docs/concept.md](docs/concept.md).
+Details are discussed in [docs/concept.md](docs/concept.md).
 
 ## Approach
 

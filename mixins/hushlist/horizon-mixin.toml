@@ -1,6 +1,6 @@
 [mod]
 id = "hushlist"
-version = "0.2.0"
+version = "0.3.0"
 
 [compatibility]
 horizon_revision = "6560641ba51a452f6bc2407baa4eb1b3be517ca8"
