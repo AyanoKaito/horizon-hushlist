@@ -14,7 +14,7 @@ use horizon_client::mod_api::{
     ClientTickPostEvent, Flow, Hooks, Host, HudBatch, KeyEvent, ModsEvent, NativeMod,
     ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent, ScreenMouseDraggedPreEvent,
     ScreenCharTypedPreEvent, ScreenKeyPressedPreEvent, ScreenMouseScrolledPreEvent, ScreenRenderPostEvent,
-    NativeWorldId, SettingsClickEvent, SettingsEvent, SoundPlayEvent,
+    NativeWorldId, SettingsClickEvent, SettingsEvent, SoundPlayEvent, Text, WorldPrimitivesEvent,
 };
 use crate::zones::{self as zn, Editor, EditorHit, HeadLayout, Shape, Zone};
 use std::path::PathBuf;
@@ -23,6 +23,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 const OPEN_KEY: &str = "open";
 const OPEN_KEY_DEFAULT: &str = "key.keyboard.h";
+/// "Show zone borders": no key until the player picks one, so it clashes with nothing.
+const BORDERS_KEY: &str = "borders";
+const NO_KEY: &str = "key.keyboard.unknown";
+/// Borders are drawn for zones whose edge is this close to the player, in blocks.
+const BORDERS_NEAR: u32 = 96;
 /// Saved this long after the last change, so a slider drag writes once.
 const SAVE_DELAY: Duration = Duration::from_millis(400);
 /// How long the nudged category volumes stay before they are restored.
@@ -151,6 +156,12 @@ struct State {
     map: MapState,
     /// The open zone's header as last drawn, for test scripts.
     head: Option<HeadLayout>,
+    /// Zone borders are shown in the world.
+    borders: bool,
+    /// Border walls of the nearby zones with their colours, what they were built for, and when.
+    border_walls: Vec<(Vec<zn::Wall>, u32)>,
+    border_key: String,
+    border_at: Option<Instant>,
     preview: Option<String>,
     drag: Option<Key>,
     trace: Option<std::fs::File>,
@@ -978,6 +989,58 @@ impl State {
         self.map.upload = true;
     }
 
+    /// What the border walls depend on: the zones of this world, their shapes and the player's area.
+    fn border_key(&self) -> String {
+        let mut key = self.engine.world.clone().unwrap_or_default();
+        for z in &self.engine.zones {
+            key.push_str(&format!("|{}:{:?}:{}:{}:{}:{:?}", z.id, z.shape, z.x, z.z, z.r, z.points));
+        }
+        if let Some(p) = self.player_pos {
+            // Coarse, so walking around rebuilds rarely.
+            key.push_str(&format!("|{}:{}", (p[0] / 32.0).floor(), (p[2] / 32.0).floor()));
+        }
+        key
+    }
+
+    /// Builds the walls of the zones near the player, standing on the ground the client knows.
+    fn build_borders(&mut self, host: &dyn Host) {
+        self.border_walls.clear();
+        let (Some(world), Some(player)) = (self.engine.world.clone(), self.player_pos) else { return };
+        let mut count = 0;
+        for (i, z) in self.engine.zones.iter().enumerate() {
+            if z.world != world || z.distance(player) > z.r as u32 + BORDERS_NEAR {
+                continue;
+            }
+            let b = zn::column_bounds(z);
+            let from = [(b[0] - 1).div_euclid(16), (b[1] - 1).div_euclid(16)];
+            let to = [b[2].div_euclid(16), b[3].div_euclid(16)];
+            let Ok(snap) = host.client_chunks(from, to) else { continue };
+            let low = snap.height().start;
+            // The y a player would stand at: on the highest block that is not a plant or leaves.
+            let ground = |bx: i32, bz: i32| -> Option<i32> {
+                if !snap.loaded([bx, bz]) {
+                    return None;
+                }
+                let mut y = snap.section_top([bx, bz]) - 1;
+                while y >= low {
+                    if let Some((id, _)) = host.block_map_color(snap.block([bx, y, bz]))
+                        && id != 0
+                        && id != 7
+                    {
+                        return Some(y + 1);
+                    }
+                    y -= 1;
+                }
+                None
+            };
+            let walls = zn::walls(z, &ground);
+            count += walls.len();
+            self.border_walls.push((walls, zn::color(i)));
+        }
+        let zones = self.border_walls.len();
+        self.trace_line(Instant::now(), &format!("\"event\":\"borders_built\",\"zones\":{zones},\"walls\":{count}"));
+    }
+
     fn page_layout(&self, host: &dyn Host, lay: &ui::Layout) -> PageLayout {
         let w = |key: &'static str| host.text_width(tr(key));
         let m = PageMeasure {
@@ -1173,7 +1236,10 @@ impl Hooks for Hushlist {
             id: MOD_ID.to_owned(),
             title: format!("Hushlist {MOD_VERSION}"),
             description: tr("mod.description").to_owned(),
-            keys: vec![[OPEN_KEY.to_owned(), tr("key.open").to_owned(), OPEN_KEY_DEFAULT.to_owned()]],
+            keys: vec![
+                [OPEN_KEY.to_owned(), tr("key.open").to_owned(), OPEN_KEY_DEFAULT.to_owned()],
+                [BORDERS_KEY.to_owned(), tr("key.borders").to_owned(), NO_KEY.to_owned()],
+            ],
         });
     }
 
@@ -1231,6 +1297,19 @@ impl Hooks for Hushlist {
 
     fn key(&self, host: &mut dyn Host, event: &mut KeyEvent<'_>) {
         if !event.pressed {
+            return;
+        }
+        let borders = host.mod_key(MOD_ID, BORDERS_KEY, NO_KEY);
+        if event.key == borders && borders != NO_KEY && host.playing() {
+            let on = {
+                let mut st = self.lock();
+                st.borders = !st.borders;
+                st.border_at = None;
+                let on = st.borders;
+                st.trace_line(Instant::now(), &format!("\"event\":\"borders\",\"on\":{on}"));
+                on
+            };
+            host.client_action_bar(Text::literal(tr(if on { "borders.on" } else { "borders.off" })), false);
             return;
         }
         let bound = host.mod_key(MOD_ID, OPEN_KEY, OPEN_KEY_DEFAULT);
@@ -1333,6 +1412,38 @@ impl Hooks for Hushlist {
             event.volume *= d.factor;
         }
         Flow::Continue
+    }
+
+    /// Zone borders in the world: a low see-through wall in each zone's colour, with a brighter top edge.
+    fn world_primitives(&self, host: &dyn Host, event: &mut WorldPrimitivesEvent<'_>) {
+        let mut st = self.lock();
+        if !st.borders {
+            return;
+        }
+        let now = Instant::now();
+        let key = st.border_key();
+        if st.border_key != key || st.border_at.is_none_or(|t| now.saturating_duration_since(t) > Duration::from_secs(3)) {
+            st.build_borders(host);
+            st.border_key = key;
+            st.border_at = Some(now);
+        }
+        let p = &mut *event.primitives;
+        for (walls, col) in &st.border_walls {
+            let fill = 0x50_00_00_00 | col;
+            let edge = 0xD0_00_00_00 | col;
+            for w in walls {
+                let (a, b) = (w.from, w.to);
+                let along_x = a[2] == b[2];
+                let t = 0.02;
+                let (min, max) = if along_x {
+                    ([a[0].min(b[0]), a[1], a[2] - t], [a[0].max(b[0]), a[1] + zn::WALL_H, a[2] + t])
+                } else {
+                    ([a[0] - t, a[1], a[2].min(b[2])], [a[0] + t, a[1] + zn::WALL_H, a[2].max(b[2])])
+                };
+                p.filled_box(min, max, fill);
+                p.line([a[0], a[1] + zn::WALL_H, a[2]], [b[0], b[1] + zn::WALL_H, b[2]], edge, 2.5);
+            }
+        }
     }
 
     fn screen_render_post(&self, host: &dyn Host, event: &mut ScreenRenderPostEvent<'_>) {

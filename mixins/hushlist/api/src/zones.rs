@@ -193,6 +193,71 @@ pub fn color(index: usize) -> u32 {
     COLORS[index % COLORS.len()]
 }
 
+/// Height of the see-through wall that shows a zone's border in the world, in blocks.
+pub const WALL_H: f64 = 1.5;
+
+/// One straight piece of a zone's border wall: its bottom edge on the ground, along x or z.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Wall {
+    pub from: [f64; 3],
+    pub to: [f64; 3],
+}
+
+/// The block columns a zone can cover: `[min x, min z, max x, max z]`, max excluded.
+pub fn column_bounds(z: &Zone) -> [i32; 4] {
+    match z.shape {
+        Shape::Points => bounds(&z.points),
+        _ => [z.x - z.r, z.z - z.r, z.x + z.r + 1, z.z + z.r + 1],
+    }
+}
+
+/// The zone's border as wall pieces: every side of a zone column that faces a column outside,
+/// standing on `ground(x, z)` (the y a player would stand at; None where not known). Pieces on
+/// one line at the same height are joined.
+pub fn walls(z: &Zone, ground: &dyn Fn(i32, i32) -> Option<i32>) -> Vec<Wall> {
+    let b = column_bounds(z);
+    let mut out = Vec::new();
+    // Sides facing north and south: lines along x.
+    for bz in b[1]..b[3] {
+        for (dz, line) in [(-1, bz), (1, bz + 1)] {
+            let mut run: Option<(i32, i32)> = None;
+            for bx in b[0]..=b[2] {
+                let face = bx < b[2] && z.holds_column(bx, bz) && !z.holds_column(bx, bz + dz);
+                let y = if face { ground(bx, bz) } else { None };
+                match (run, y) {
+                    (Some((_, ry)), Some(y)) if y == ry => {}
+                    (Some((s, ry)), _) => {
+                        out.push(Wall { from: [f64::from(s), f64::from(ry), f64::from(line)], to: [f64::from(bx), f64::from(ry), f64::from(line)] });
+                        run = y.map(|y| (bx, y));
+                    }
+                    (None, Some(y)) => run = Some((bx, y)),
+                    (None, None) => {}
+                }
+            }
+        }
+    }
+    // Sides facing west and east: lines along z.
+    for bx in b[0]..b[2] {
+        for (dx, line) in [(-1, bx), (1, bx + 1)] {
+            let mut run: Option<(i32, i32)> = None;
+            for bz in b[1]..=b[3] {
+                let face = bz < b[3] && z.holds_column(bx, bz) && !z.holds_column(bx + dx, bz);
+                let y = if face { ground(bx, bz) } else { None };
+                match (run, y) {
+                    (Some((_, ry)), Some(y)) if y == ry => {}
+                    (Some((s, ry)), _) => {
+                        out.push(Wall { from: [f64::from(line), f64::from(ry), f64::from(s)], to: [f64::from(line), f64::from(ry), f64::from(bz)] });
+                        run = y.map(|y| (bz, y));
+                    }
+                    (None, Some(y)) => run = Some((bz, y)),
+                    (None, None) => {}
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn parse(text: &str) -> Vec<Zone> {
     let mut out = Vec::new();
     let mut cur: Option<(Zone, String)> = None;
@@ -637,6 +702,29 @@ mod tests {
         // Another world: the zone does nothing.
         e.world = Some("sp:other".into());
         assert_eq!(e.factor("entity.chicken.ambient", inside, false), 0.5);
+    }
+
+    #[test]
+    fn border_walls_follow_the_edge_and_the_ground() {
+        let flat = |_: i32, _: i32| Some(64);
+        let z = zone(Shape::Square, 0, 0, 1);
+        let mut w = walls(&z, &flat);
+        w.sort_by(|a, b| a.from.partial_cmp(&b.from).unwrap());
+        assert_eq!(w.len(), 4, "one joined piece a side");
+        assert!(w.contains(&Wall { from: [-1.0, 64.0, -1.0], to: [2.0, 64.0, -1.0] }));
+        assert!(w.contains(&Wall { from: [2.0, 64.0, -1.0], to: [2.0, 64.0, 2.0] }));
+        // A step in the ground splits a side.
+        let step = |x: i32, _: i32| Some(if x >= 1 { 65 } else { 64 });
+        assert_eq!(walls(&z, &step).len(), 6);
+        // Unknown ground: no wall there.
+        assert!(walls(&z, &|_, _| None).is_empty());
+        // A circle's border is closed: every piece has the same length on each axis in total.
+        let c = zone(Shape::Circle, 0, 0, 5);
+        let total = |w: &[Wall], along_x: bool| -> f64 {
+            w.iter().filter(|p| (p.from[2] == p.to[2]) == along_x).map(|p| (p.to[0] - p.from[0]).abs() + (p.to[2] - p.from[2]).abs()).sum()
+        };
+        let cw = walls(&c, &flat);
+        assert_eq!(total(&cw, true), total(&cw, false));
     }
 
     #[test]

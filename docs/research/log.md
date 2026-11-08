@@ -2,6 +2,18 @@
 
 Dated record of what was checked and what it proved. Each entry separates what was confirmed from what was not.
 
+## 2026-11-08 — Zones, part 3 (borders in the world)
+
+**Pin:** Horizon Nightly `6560641ba51a452f6bc2407baa4eb1b3be517ca8`.
+
+**Change:** the Mods page has a second key, "Show zone borders", with no key until the player sets one. It shows and hides the borders of the zones within 96 blocks: a see-through wall 1.5 blocks high in the zone's colour along every block side at the zone's edge, standing on the highest block that is not a plant or leaves, with a brighter top edge. The action bar says whether the borders are shown. Walls are rebuilt when zones change, when the player moves about 32 blocks, and every 3 seconds.
+
+**Findings:** Horizon's world primitives (filled boxes and lines in world coordinates, depth tested) are enough for the walls; the ground comes from the client's chunk snapshot.
+
+**Confirmed** (isolated offscreen runs, English and Russian, standard test meadow): the key row read "Not Bound" until set; set to K, it turned the borders on (47 wall pieces for a radius-8 circle) and off, with the action bar message; screenshots show the wall following the ground around the zone. The Mods page checks still pass with the second key.
+
+**Not confirmed:** frame time with many zones shown; walls on servers; zones whose ground is not loaded.
+
 ## 2026-11-08 — Zones, part 2 (points)
 
 **Pin:** Horizon Nightly `6560641ba51a452f6bc2407baa4eb1b3be517ca8`.

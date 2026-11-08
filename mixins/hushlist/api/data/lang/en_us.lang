@@ -150,6 +150,9 @@ group.entity.boat=Boat
 # Mods menu page
 mod.description=Turn down individual sounds: a live list of what you hear, with a volume for each sound and each group.
 key.open=Hotkey to open
+key.borders=Show zone borders
+borders.on=Zone borders shown
+borders.off=Zone borders hidden
 page.reset=Reset all sound settings...
 page.reset_yes=Yes, reset in every profile
 
