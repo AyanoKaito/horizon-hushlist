@@ -149,6 +149,8 @@ struct State {
     editor: Option<Editor>,
     /// The editor's radius slider is held.
     zone_drag: bool,
+    /// The editor's corner being dragged.
+    point_drag: Option<usize>,
     /// Zone list scroll in GUI pixels.
     zscroll: f32,
     /// The player's position at the last tick.
@@ -158,6 +160,8 @@ struct State {
     head: Option<HeadLayout>,
     /// Zone borders are shown in the world.
     borders: bool,
+    /// Widths of the corner menu's "Delete" and "Keep", as last drawn (for test scripts).
+    menu_widths: (f32, f32),
     /// Border walls of the nearby zones with their colours, what they were built for, and when.
     border_walls: Vec<(Vec<zn::Wall>, u32)>,
     border_key: String,
@@ -764,6 +768,7 @@ impl State {
             high: by + zn::HEIGHT_HALF,
             far: false,
             points: Vec::new(),
+            menu: None,
         });
         self.list.search_focus = false;
     }
@@ -783,6 +788,7 @@ impl State {
             high: z.high,
             far: z.r > 28,
             points: z.points.clone(),
+            menu: None,
         });
         self.list.tab = Tab::Zones;
         self.list.search_focus = false;
@@ -883,6 +889,17 @@ impl State {
         let m = self.zone_measure(host);
         if self.editor.is_some() {
             let el = zn::editor_layout(area, &m);
+            // The corner's "Delete" / "Keep" pair takes the click; a click elsewhere keeps the corner.
+            if let Some((i, at)) = self.editor.as_ref().and_then(|e| e.menu) {
+                let (del, _) = zn::menu_rects(at, host.text_width(tr("zones.point_delete")), host.text_width(tr("zones.point_keep")), el.map);
+                if let Some(e) = self.editor.as_mut() {
+                    if ui::contains(del, mouse) && i < e.points.len() {
+                        e.points.remove(i);
+                    }
+                    e.menu = None;
+                }
+                return;
+            }
             let points_mode = self.editor.as_ref().is_some_and(|e| e.shape == Shape::Points);
             let hit = zn::editor_hit(&el, mouse, points_mode);
             match hit {
@@ -906,7 +923,7 @@ impl State {
                 }
                 EditorHit::Points => e.shape = Shape::Points,
                 EditorHit::Clear => e.points.clear(),
-                EditorHit::Map => e.click_map(el.map, mouse),
+                EditorHit::Map => self.point_drag = e.press_map(el.map, mouse),
                 EditorHit::Near => e.far = false,
                 EditorHit::Far => e.far = true,
                 EditorHit::Slider => e.r = zn::slider_radius(el.slider, mouse[0]),
@@ -1463,6 +1480,19 @@ impl Hooks for Hushlist {
             return Flow::Continue;
         }
         if event.button != 0 {
+            // A right press on a corner in the zone editor opens its "Delete" / "Keep" pair.
+            if event.button == 1 {
+                let now = Instant::now();
+                let mut st = self.lock();
+                if st.list.tab == Tab::Zones && st.editor.is_some() {
+                    let (_, _, fresh) = st.rows(now);
+                    let lay = st.layout(host, fresh);
+                    let el = zn::editor_layout(zones_area(&lay), &st.zone_measure(host));
+                    if let Some(e) = st.editor.as_mut() {
+                        e.open_menu(el.map, event.screen.mouse);
+                    }
+                }
+            }
             return Flow::Cancel;
         }
         let now = Instant::now();
@@ -1649,6 +1679,7 @@ impl Hooks for Hushlist {
         let mut st = self.lock();
         st.drag = None;
         st.zone_drag = false;
+        st.point_drag = None;
         Flow::Cancel
     }
 
@@ -1658,12 +1689,18 @@ impl Hooks for Hushlist {
         }
         let now = Instant::now();
         let mut st = self.lock();
-        if st.zone_drag {
+        if st.zone_drag || st.point_drag.is_some() {
             let fresh = 0;
             let lay = st.layout(host, fresh);
             let el = zn::editor_layout(zones_area(&lay), &st.zone_measure(host));
+            let held = st.point_drag;
+            let slider = st.zone_drag;
             if let Some(e) = st.editor.as_mut() {
-                e.r = zn::slider_radius(el.slider, event.screen.mouse[0]);
+                if let Some(i) = held {
+                    e.move_point(i, el.map, event.screen.mouse);
+                } else if slider {
+                    e.r = zn::slider_radius(el.slider, event.screen.mouse[0]);
+                }
             }
             return Flow::Cancel;
         }
@@ -2351,15 +2388,29 @@ fn draw_zones(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
                 host.fill(b, [mx - 2.0, my - 2.0, 4.0, 4.0], argb(AMBER));
             }
         }
-        // Corners placed on the map: white squares on the block corners.
-        let o = e.origin();
-        let cell = map[2] / e.span() as f32;
-        for pt in &e.points {
-            let px = map[0] + (pt[0] - o[0]) as f32 * cell;
-            let py = map[1] + (pt[1] - o[1]) as f32 * cell;
+        // Corners placed on the map: white squares on the block corners; the one under the
+        // pointer, held or asked about grows a little.
+        let hot = st.point_drag.or(e.menu.map(|m| m.0)).or_else(|| e.point_at(map, mouse));
+        for i in 0..e.points.len() {
+            let [px, py] = e.corner_pos(map, i);
             if ui::contains([map[0] - 1.0, map[1] - 1.0, map[2] + 2.0, map[3] + 2.0], [px, py]) {
-                host.fill(b, [px - 3.0, py - 3.0, 6.0, 6.0], argb(0x17_15_1E));
-                host.fill(b, [px - 2.0, py - 2.0, 4.0, 4.0], argb(0xFF_FF_FF));
+                let s = if hot == Some(i) { 1.0 } else { 0.0 };
+                host.fill(b, [px - 3.0 - s, py - 3.0 - s, 6.0 + 2.0 * s, 6.0 + 2.0 * s], argb(0x17_15_1E));
+                host.fill(b, [px - 2.0 - s, py - 2.0 - s, 4.0 + 2.0 * s, 4.0 + 2.0 * s], argb(if hot == Some(i) { OWN } else { 0xFF_FF_FF }));
+            }
+        }
+        st.menu_widths = (host.text_width(tr("zones.point_delete")), host.text_width(tr("zones.point_keep")));
+        if let Some((_, at)) = e.menu {
+            let (del_l, keep_l) = (tr("zones.point_delete"), tr("zones.point_keep"));
+            let (del, keep) = zn::menu_rects(at, host.text_width(del_l), host.text_width(keep_l), map);
+            let back = [del[0] - 3.0, del[1] - 3.0, keep[0] + keep[2] - del[0] + 6.0, del[3] + 6.0];
+            rrect(host, b, [back[0] - 1.0, back[1] - 1.0, back[2] + 2.0, back[3] + 2.0], 4.0, 0x30_FF_FF_FF);
+            rrect(host, b, back, 3.0, MENU);
+            for (r, l, rgb) in [(del, del_l, DANGER), (keep, keep_l, TEXT)] {
+                if ui::contains(r, mouse) {
+                    rrect(host, b, r, 2.0, 0x24_FF_FF_FF);
+                }
+                host.text(b, l, [r[0] + 6.0, r[1] + 3.0], rgb, false);
             }
         }
         let title = tr(if e.id.is_some() { "zones.title_edit" } else { "zones.title_new" });
@@ -2518,9 +2569,13 @@ fn dump_zones(st: &mut State, list: Option<&zn::ListLayout>, editor: Option<&zn:
     if let (Some(el), Some(e)) = (editor, st.editor.as_ref()) {
         let ready = st.map.uploaded_key.is_some() && st.map.uploaded_key == st.map.image_key;
         layout.push_str(&format!(
-            ",\"editor\":true,\"e_name\":{:?},\"e_typing\":{},\"e_shape\":\"{:?}\",\"e_r\":{},\"e_far\":{},\"e_area\":{},\"map_ready\":{},\"map\":{},\"e_field\":{},\"e_circle\":{},\"e_square\":{},\"e_near\":{},\"e_far_btn\":{},\"e_slider\":{},\"e_save\":{},\"e_cancel\":{},\"e_points_btn\":{},\"e_clear\":{},\"e_points\":{:?},\"e_x\":{},\"e_z\":{},\"e_span\":{},\"e_complete\":{}",
+            ",\"editor\":true,\"e_name\":{:?},\"e_typing\":{},\"e_shape\":\"{:?}\",\"e_r\":{},\"e_far\":{},\"e_area\":{},\"map_ready\":{},\"map\":{},\"e_field\":{},\"e_circle\":{},\"e_square\":{},\"e_near\":{},\"e_far_btn\":{},\"e_slider\":{},\"e_save\":{},\"e_cancel\":{},\"e_points_btn\":{},\"e_clear\":{},\"e_points\":{:?},\"e_x\":{},\"e_z\":{},\"e_span\":{},\"e_complete\":{},\"e_menu\":{}",
             e.name, e.typing, e.shape, e.r, e.far, e.area(), ready, r(el.map), r(el.name), r(el.circle), r(el.square), r(el.near), r(el.far), r(el.slider), r(el.save), r(el.cancel),
-            r(el.points), r(el.clear), e.points, e.x, e.z, e.span(), e.complete()
+            r(el.points), r(el.clear), e.points, e.x, e.z, e.span(), e.complete(),
+            e.menu.map_or("null".to_owned(), |(_, at)| {
+                let (d, k) = zn::menu_rects(at, st.menu_widths.0, st.menu_widths.1, el.map);
+                format!("[{},{}]", r(d), r(k))
+            })
         ));
     }
     let mut path = std::path::PathBuf::from(trace);

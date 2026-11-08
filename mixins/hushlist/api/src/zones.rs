@@ -356,6 +356,8 @@ pub struct Editor {
     pub far: bool,
     /// Corners placed on the map (shape Points).
     pub points: Vec<[i32; 2]>,
+    /// A right click on a corner: which one, and where the "Delete" / "Keep" pair appears.
+    pub menu: Option<(usize, [f32; 2])>,
 }
 
 impl Editor {
@@ -382,21 +384,59 @@ impl Editor {
     pub fn origin(&self) -> [i32; 2] {
         [self.x - self.span() / 2, self.z - self.span() / 2]
     }
-    /// A click on the map at `at` (GUI pixels) in `map`: adds a corner there, or removes the corner
-    /// already there. Ignored for other shapes and past [`POINTS_MAX`].
-    pub fn click_map(&mut self, map: Rect, at: [f32; 2]) {
-        if self.shape != Shape::Points || !contains(map, at) {
-            return;
-        }
+    /// The block corner nearest to `at` (GUI pixels) on `map`, kept on the map.
+    pub fn corner_at(&self, map: Rect, at: [f32; 2]) -> [i32; 2] {
         let span = self.span() as f32;
         let o = self.origin();
-        let cx = o[0] + ((at[0] - map[0]) / map[2] * span).round() as i32;
-        let cz = o[1] + ((at[1] - map[1]) / map[3] * span).round() as i32;
-        if let Some(i) = self.points.iter().position(|p| p[0] == cx && p[1] == cz) {
-            self.points.remove(i);
-        } else if self.points.len() < POINTS_MAX {
-            self.points.push([cx, cz]);
+        let fx = ((at[0] - map[0]) / map[2] * span).round().clamp(0.0, span);
+        let fz = ((at[1] - map[1]) / map[3] * span).round().clamp(0.0, span);
+        [o[0] + fx as i32, o[1] + fz as i32]
+    }
+
+    /// Where corner `i` is drawn on `map`.
+    pub fn corner_pos(&self, map: Rect, i: usize) -> [f32; 2] {
+        let cell = map[2] / self.span() as f32;
+        let o = self.origin();
+        let p = self.points[i];
+        [map[0] + (p[0] - o[0]) as f32 * cell, map[1] + (p[1] - o[1]) as f32 * cell]
+    }
+
+    /// The corner under the pointer (within a few pixels), the last placed first.
+    pub fn point_at(&self, map: Rect, at: [f32; 2]) -> Option<usize> {
+        (0..self.points.len()).rev().find(|i| {
+            let p = self.corner_pos(map, *i);
+            (p[0] - at[0]).abs() <= 4.0 && (p[1] - at[1]).abs() <= 4.0
+        })
+    }
+
+    /// A left press on the map: grabs the corner under the pointer, or places a new one there
+    /// (up to [`POINTS_MAX`]). Returns the corner to drag. Nothing for other shapes.
+    pub fn press_map(&mut self, map: Rect, at: [f32; 2]) -> Option<usize> {
+        if self.shape != Shape::Points || !contains(map, at) {
+            return None;
         }
+        if let Some(i) = self.point_at(map, at) {
+            return Some(i);
+        }
+        if self.points.len() >= POINTS_MAX {
+            return None;
+        }
+        let c = self.corner_at(map, at);
+        self.points.push(c);
+        Some(self.points.len() - 1)
+    }
+
+    /// Drags corner `i` to the block corner nearest the pointer.
+    pub fn move_point(&mut self, i: usize, map: Rect, at: [f32; 2]) {
+        let c = self.corner_at(map, at);
+        if let Some(p) = self.points.get_mut(i) {
+            *p = c;
+        }
+    }
+
+    /// A right press on a corner opens its "Delete" / "Keep" pair under the pointer.
+    pub fn open_menu(&mut self, map: Rect, at: [f32; 2]) {
+        self.menu = if self.shape == Shape::Points { self.point_at(map, at).map(|i| (i, at)) } else { None };
     }
 }
 
@@ -537,6 +577,15 @@ pub fn editor_layout(area: Rect, m: &Measure) -> EditorLayout {
 }
 
 /// Radius for a pointer at `px` on the slider.
+/// The "Delete" and "Keep" buttons under the pointer at `at`, kept inside `bounds`.
+pub fn menu_rects(at: [f32; 2], delete_w: f32, keep_w: f32, bounds: Rect) -> (Rect, Rect) {
+    let (dw, kw) = (delete_w + 12.0, keep_w + 12.0);
+    let w = dw + 3.0 + kw;
+    let x = (at[0] + 4.0).min(bounds[0] + bounds[2] - w).max(bounds[0]);
+    let y = (at[1] + 6.0).min(bounds[1] + bounds[3] - 14.0).max(bounds[1]);
+    ([x, y, dw, 14.0], [x + dw + 3.0, y, kw, 14.0])
+}
+
 pub fn slider_radius(slider: Rect, px: f32) -> i32 {
     let t = ((px - slider[0] - 2.0) / (slider[2] - 4.0)).clamp(0.0, 1.0);
     RADIUS_MIN + (t * (RADIUS_MAX - RADIUS_MIN) as f32).round() as i32
@@ -801,22 +850,36 @@ mod tests {
     }
 
     #[test]
-    fn map_clicks_add_and_remove_corners() {
-        let mut e = Editor { id: None, name: String::new(), typing: false, shape: Shape::Points, x: 100, z: 50, r: 8, low: 0, high: 10, far: false, points: Vec::new() };
+    fn map_presses_place_and_grab_corners() {
+        let mut e = Editor { id: None, name: String::new(), typing: false, shape: Shape::Points, x: 100, z: 50, r: 8, low: 0, high: 10, far: false, points: Vec::new(), menu: None };
         let map = [0.0, 0.0, 256.0, 256.0];
         // 4 px a block when near: the middle of the map is the corner (100, 50).
-        e.click_map(map, [128.0, 128.0]);
+        assert_eq!(e.press_map(map, [128.0, 128.0]), Some(0));
         assert_eq!(e.points, vec![[100, 50]]);
-        e.click_map(map, [129.0, 127.0]);
-        assert!(e.points.is_empty(), "a click on a corner removes it");
+        // A press on a corner grabs it instead of placing another.
+        assert_eq!(e.press_map(map, [129.0, 127.0]), Some(0));
+        assert_eq!(e.points.len(), 1);
+        e.move_point(0, map, [137.0, 120.0]);
+        assert_eq!(e.points, vec![[102, 48]]);
+        // Dragged past the edge, it stays on the map.
+        e.move_point(0, map, [-50.0, 300.0]);
+        assert_eq!(e.points, vec![[68, 82]]);
         assert!(!e.complete());
+        // Right press on the corner: the menu for it, where the pointer is.
+        let at = e.corner_pos(map, 0);
+        e.open_menu(map, at);
+        assert_eq!(e.menu, Some((0, at)));
+        e.open_menu(map, [200.0, 200.0]);
+        assert_eq!(e.menu, None);
         for i in 0..12 {
-            e.click_map(map, [10.0 + i as f32 * 8.0, 20.0]);
+            e.press_map(map, [10.0 + i as f32 * 8.0, 20.0]);
         }
         assert_eq!(e.points.len(), POINTS_MAX);
         assert!(e.complete());
         e.shape = Shape::Circle;
-        e.click_map(map, [200.0, 200.0]);
+        assert_eq!(e.press_map(map, [200.0, 200.0]), None);
         assert_eq!(e.points.len(), POINTS_MAX);
+        let (d, k) = menu_rects([250.0, 250.0], 30.0, 30.0, map);
+        assert!(d[0] + d[2] < k[0] && k[0] + k[2] <= 256.0 && d[1] + d[3] <= 256.0);
     }
 }

@@ -2,6 +2,12 @@
 
 Dated record of what was checked and what it proved. Each entry separates what was confirmed from what was not.
 
+## 2026-11-08 — Moving and deleting corners
+
+**Change:** in the zone editor, pressing on a corner and dragging moves it along the block grid; a press elsewhere on the map places a new corner. A right click on a corner shows two small buttons under the pointer, Delete and Keep; a click anywhere else keeps the corner. A second left click on a corner no longer removes it.
+
+**Confirmed** (isolated offscreen runs, English and Russian): a wrong corner was removed with right click and Delete; right click and Keep left a corner in place; a corner placed three blocks off was dragged onto the right block corner; the zone then behaved as before (chickens inside silenced, outside heard). The circle checks still pass.
+
 ## 2026-11-08 — Zones, part 3 (borders in the world)
 
 **Pin:** Horizon Nightly `6560641ba51a452f6bc2407baa4eb1b3be517ca8`.
