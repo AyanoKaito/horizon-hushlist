@@ -1,13 +1,10 @@
 // Hushlist core: per-sound volume, per-group volume, cooldowns and the recent-sound log.
-// Shared by the standalone library (unit tests) and the module injected next to Horizon's
-// client sound hook (`horizon_client_lib::sound_playback`).
+// No game types: the trait mod (lib.rs) feeds it, and the standalone crate tests it.
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 pub const MOD_ID: &str = "hushlist";
-pub const MOD_VERSION: &str = "0.1.0";
+pub const MOD_VERSION: &str = "0.2.0";
 pub const SETTINGS_FILE: &str = "settings.txt";
 /// Sounds stay in the recent list this long after they last played.
 pub const RECENT_WINDOW: Duration = Duration::from_secs(300);
@@ -15,10 +12,13 @@ pub const RECENT_WINDOW: Duration = Duration::from_secs(300);
 pub const RECENT_MAX: usize = 200;
 /// Longest cooldown accepted from settings.
 pub const COOLDOWN_MAX_SECS: u32 = 600;
-/// How often the settings file is checked for changes.
-const RELOAD_INTERVAL: Duration = Duration::from_secs(1);
+/// A sound counts as still playing while it gets live updates this recently.
+pub const ALIVE_WINDOW: Duration = Duration::from_millis(600);
+/// A sound counts as long (rain, a portal, a disc) once it has kept playing this long;
+/// mob sounds that follow their mob get updates too, but only for about a second.
+pub const LONG_AFTER: Duration = Duration::from_millis(1500);
 /// Families whose sounds form one group regardless of the second ID segment.
-const WHOLE_GROUPS: [&str; 6] = ["music", "music_disc", "weather", "ui", "event", "ambient"];
+pub const WHOLE_GROUPS: [&str; 6] = ["music", "music_disc", "weather", "ui", "event", "ambient"];
 
 /// The sound event ID without the `minecraft:` namespace.
 pub fn normalize(id: &str) -> &str {
@@ -114,6 +114,11 @@ impl Settings {
             .unwrap_or(100)
     }
 
+    /// Group volume in percent (100 when the group has none).
+    pub fn group_percent(&self, group: &str) -> u8 {
+        self.groups.get(group).copied().unwrap_or(100)
+    }
+
     /// Effective volume as a multiplier of the game's volume.
     pub fn volume_factor(&self, id: &str) -> f32 {
         f32::from(self.volume_percent(id)) / 100.0
@@ -138,23 +143,41 @@ pub struct Heard {
     pub source: usize,
     /// World position of the last play.
     pub position: [f64; 3],
+    /// Last start.
     pub last: Instant,
+    /// Last start or live update: a sound updated within [`ALIVE_WINDOW`] is still playing.
+    pub alive: Instant,
     pub count: u32,
+}
+
+impl Heard {
+    pub fn playing(&self, now: Instant) -> bool {
+        self.alive.saturating_duration_since(self.last) >= LONG_AFTER
+            && now.saturating_duration_since(self.alive) <= ALIVE_WINDOW
+    }
 }
 
 /// Sounds the player actually heard recently, one entry per sound event.
 #[derive(Clone, Debug, Default)]
 pub struct Recent {
     entries: Vec<Heard>,
+    /// Position of each ID in `entries`.
+    index: HashMap<String, usize>,
 }
 
 impl Recent {
     pub fn record(&mut self, id: &str, source: usize, position: [f64; 3], now: Instant) {
-        self.prune(now);
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
+        if self.entries.first().is_some_and(|e| now.saturating_duration_since(e.alive) > RECENT_WINDOW)
+            || self.entries.len() >= RECENT_MAX
+        {
+            self.prune(now);
+        }
+        if let Some(&i) = self.index.get(id) {
+            let entry = &mut self.entries[i];
             entry.source = source;
             entry.position = position;
             entry.last = now;
+            entry.alive = now;
             entry.count = entry.count.saturating_add(1);
             return;
         }
@@ -167,20 +190,40 @@ impl Recent {
                 .map(|(i, _)| i)
         {
             self.entries.swap_remove(oldest);
+            self.reindex();
         }
+        self.index.insert(id.to_owned(), self.entries.len());
         self.entries.push(Heard {
             id: id.to_owned(),
             source,
             position,
             last: now,
+            alive: now,
             count: 1,
         });
     }
 
+    /// A live update of a sound already in the list.
+    pub fn touch(&mut self, id: &str, position: [f64; 3], now: Instant) {
+        if let Some(&i) = self.index.get(id) {
+            let entry = &mut self.entries[i];
+            entry.alive = now;
+            entry.position = position;
+        }
+    }
+
     /// Drops sounds not heard within [`RECENT_WINDOW`].
     pub fn prune(&mut self, now: Instant) {
+        let before = self.entries.len();
         self.entries
-            .retain(|e| now.saturating_duration_since(e.last) <= RECENT_WINDOW);
+            .retain(|e| now.saturating_duration_since(e.alive) <= RECENT_WINDOW);
+        if self.entries.len() != before {
+            self.reindex();
+        }
+    }
+
+    fn reindex(&mut self) {
+        self.index = self.entries.iter().enumerate().map(|(i, e)| (e.id.clone(), i)).collect();
     }
 
     /// Most recently heard first.
@@ -188,6 +231,10 @@ impl Recent {
         let mut list: Vec<_> = self.entries.iter().collect();
         list.sort_by(|a, b| b.last.cmp(&a.last).then_with(|| a.id.cmp(&b.id)));
         list
+    }
+
+    pub fn get(&self, id: &str) -> Option<&Heard> {
+        self.index.get(id).map(|&i| &self.entries[i])
     }
 
     pub fn len(&self) -> usize {
@@ -208,7 +255,7 @@ pub struct Decision {
     pub cancel: bool,
 }
 
-/// The mod's live state.
+/// The mod's sound state.
 #[derive(Debug, Default)]
 pub struct Engine {
     pub settings: Settings,
@@ -240,197 +287,27 @@ impl Engine {
             }
             self.last_start.insert(id.to_owned(), now);
             self.recent.record(id, source, position, now);
+        } else {
+            self.recent.touch(id, position, now);
         }
         Decision {
             factor: self.settings.volume_factor(id),
             cancel: false,
         }
     }
-
-    /// Replaces the settings. Cooldown timers of sounds keep running.
-    pub fn set_settings(&mut self, settings: Settings) {
-        self.settings = settings;
-    }
 }
 
-// ---------------------------------------------------------------------------
-// Runtime glue: process-wide state, settings file, live refresh, test trace.
-// Only the game calls these; unit tests use `Engine` directly.
-
-/// Process-wide state behind the game's sound hook (game thread only).
-struct Runtime {
-    engine: Engine,
-    path: Option<PathBuf>,
-    modified: Option<SystemTime>,
-    next_check: Option<Instant>,
-    /// Pending live refresh: 1 = nudge category volumes, 2 = restore them.
-    refresh: u8,
-    saved_volumes: Option<[f32; 11]>,
-    nudged_at: Option<Instant>,
-    traced: HashMap<String, Instant>,
-    trace: Option<std::fs::File>,
-    started: Option<Instant>,
-}
-
-fn runtime() -> MutexGuard<'static, Runtime> {
-    static RUNTIME: OnceLock<Mutex<Runtime>> = OnceLock::new();
-    RUNTIME
-        .get_or_init(|| {
-            Mutex::new(Runtime {
-                engine: Engine::default(),
-                path: None,
-                modified: None,
-                next_check: None,
-                refresh: 0,
-                saved_volumes: None,
-                nudged_at: None,
-                traced: HashMap::new(),
-                trace: None,
-                started: None,
-            })
-        })
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-}
-
-/// `config/hushlist/settings.txt` in the game folder (the working directory).
-pub fn settings_path() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_default()
-        .join("config")
-        .join(MOD_ID)
-        .join(SETTINGS_FILE)
-}
-
-impl Runtime {
-    fn ensure_started(&mut self, now: Instant) {
-        if self.started.is_some() {
-            return;
-        }
-        self.started = Some(now);
-        self.path = Some(settings_path());
-        if let Some(path) = std::env::var_os("HUSHLIST_TRACE") {
-            self.trace = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .ok();
-        }
-        self.reload(now);
+/// Category volumes moved by an inaudible amount. Horizon re-applies the sound
+/// hook to every playing sound of a category whose option volume changed, so
+/// writing these for a moment and then the originals makes a settings change
+/// reach sounds that are already playing. Index 0 (master) is left alone.
+pub fn nudged(volumes: [f32; 11], phase: bool) -> [f32; 11] {
+    let step = if phase { 2.0e-4 } else { 1.0e-4 };
+    let mut out = volumes;
+    for v in out.iter_mut().skip(1) {
+        *v = if *v > 0.5 { *v - step } else { *v + step };
     }
-
-    fn reload(&mut self, now: Instant) {
-        self.next_check = Some(now + RELOAD_INTERVAL);
-        let Some(path) = self.path.clone() else {
-            return;
-        };
-        let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-        if modified == self.modified {
-            return;
-        }
-        self.modified = modified;
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
-        let settings = Settings::parse(&text);
-        if settings != self.engine.settings {
-            self.engine.set_settings(settings);
-            self.refresh = 1;
-            self.trace_line(now, &format!("\"event\":\"reload\",\"entries\":{}", self.entry_count()));
-        }
-    }
-
-    fn entry_count(&self) -> usize {
-        let s = &self.engine.settings;
-        s.sounds.len() + s.groups.len() + s.cooldowns.len()
-    }
-
-    fn trace_line(&mut self, now: Instant, body: &str) {
-        let Some(file) = self.trace.as_mut() else {
-            return;
-        };
-        let ms = self
-            .started
-            .map_or(0, |s| now.saturating_duration_since(s).as_millis());
-        use std::io::Write;
-        let _ = writeln!(file, "{{\"ms\":{ms},{body}}}");
-    }
-}
-
-/// Called by the game's sound hook for every start and live update.
-pub fn on_play(
-    identifier: &str,
-    source: usize,
-    position: [f64; 3],
-    starting: bool,
-    volume: &mut f32,
-    cancel: &mut bool,
-) {
-    if *cancel {
-        return;
-    }
-    let now = Instant::now();
-    let mut rt = runtime();
-    rt.ensure_started(now);
-    if rt.next_check.is_none_or(|t| now >= t) {
-        rt.reload(now);
-    }
-    let decision = rt.engine.decide(identifier, source, position, starting, now);
-    if decision.cancel {
-        *cancel = true;
-    } else if decision.factor != 1.0 {
-        *volume *= decision.factor;
-    }
-    if starting || decision.factor != 1.0 {
-        let id = normalize(identifier).to_owned();
-        let body = format!(
-            "\"id\":\"{id}\",\"source\":{source},\"pos\":[{:.1},{:.1},{:.1}],\"starting\":{starting},\"factor\":{},\"cancel\":{},\"volume\":{}",
-            position[0], position[1], position[2], decision.factor, decision.cancel, *volume
-        );
-        // Live updates of an edited sound repeat every tick: trace them once a second.
-        let due = starting
-            || rt
-                .traced
-                .get(&id)
-                .is_none_or(|t| now.saturating_duration_since(*t) >= Duration::from_secs(1));
-        if due {
-            rt.traced.insert(id, now);
-            rt.trace_line(now, &body);
-        }
-    }
-}
-
-/// Time the nudged category volumes stay, so the audio tick sees them.
-pub const NUDGE_HOLD: Duration = Duration::from_millis(150);
-
-/// Live refresh after a settings change. Horizon re-applies the sound hook to
-/// every playing sound of a category whose option volume changed, so the
-/// category volumes are moved by an inaudible amount for at least
-/// [`NUDGE_HOLD`] and then restored. `read` and `write` are the game's option
-/// volume accessors. Call it outside [`on_play`]'s lock.
-pub fn refresh_step(now: Instant, read: impl Fn(usize) -> f32, write: impl Fn([f32; 11])) {
-    let mut rt = runtime();
-    match rt.refresh {
-        1 => {
-            let mut volumes = [0.0f32; 11];
-            for (i, v) in volumes.iter_mut().enumerate() {
-                *v = read(i);
-            }
-            rt.saved_volumes = Some(volumes);
-            let mut nudged = volumes;
-            for v in nudged.iter_mut().skip(1) {
-                *v = if *v > 0.5 { *v - 1.0e-4 } else { *v + 1.0e-4 };
-            }
-            write(nudged);
-            rt.nudged_at = Some(now);
-            rt.refresh = 2;
-        }
-        2 if rt.nudged_at.is_some_and(|t| now.saturating_duration_since(t) >= NUDGE_HOLD) => {
-            if let Some(volumes) = rt.saved_volumes.take() {
-                write(volumes);
-            }
-            rt.refresh = 0;
-        }
-        _ => {}
-    }
+    out
 }
 
 #[cfg(test)]
@@ -457,12 +334,12 @@ mod tests {
 
     #[test]
     fn own_volume_wins_over_group_and_group_over_default() {
-        let s = Settings::parse(
-            "group entity.chicken 30\nsound minecraft:entity.chicken.egg 50\n",
-        );
+        let s = Settings::parse("group entity.chicken 30\nsound minecraft:entity.chicken.egg 50\n");
         assert_eq!(s.volume_percent("entity.chicken.egg"), 50);
         assert_eq!(s.volume_percent("minecraft:entity.chicken.ambient"), 30);
         assert_eq!(s.volume_percent("entity.cow.ambient"), 100);
+        assert_eq!(s.group_percent("entity.chicken"), 30);
+        assert_eq!(s.group_percent("entity.cow"), 100);
         assert!((s.volume_factor("entity.chicken.ambient") - 0.3).abs() < 1e-6);
     }
 
@@ -491,7 +368,7 @@ mod tests {
     fn cooldown_skips_starts_inside_the_pause_only() {
         let t0 = Instant::now();
         let mut e = Engine::default();
-        e.set_settings(Settings::parse("cooldown entity.villager.ambient 10\n"));
+        e.settings = Settings::parse("cooldown entity.villager.ambient 10\n");
         let id = "minecraft:entity.villager.ambient";
         assert!(!e.decide(id, 6, [0.0; 3], true, t0).cancel);
         assert!(e.decide(id, 6, [0.0; 3], true, at(t0, 4)).cancel);
@@ -510,10 +387,27 @@ mod tests {
     fn skipped_starts_are_not_heard() {
         let t0 = Instant::now();
         let mut e = Engine::default();
-        e.set_settings(Settings::parse("cooldown a.b.c 10\n"));
+        e.settings = Settings::parse("cooldown a.b.c 10\n");
         e.decide("a.b.c", 0, [0.0; 3], true, t0);
         e.decide("a.b.c", 0, [0.0; 3], true, at(t0, 1));
         assert_eq!(e.recent.list()[0].count, 1);
+    }
+
+    #[test]
+    fn live_updates_mark_a_sound_as_playing() {
+        let t0 = Instant::now();
+        let mut e = Engine::default();
+        e.decide("weather.rain", 3, [0.0; 3], true, t0);
+        assert!(!e.recent.get("weather.rain").unwrap().playing(t0));
+        // Updated for half a second: a mob sound following its mob, not a long sound.
+        e.decide("weather.rain", 3, [0.5; 3], false, t0 + Duration::from_millis(500));
+        assert!(!e.recent.get("weather.rain").unwrap().playing(t0 + Duration::from_millis(550)));
+        e.decide("weather.rain", 3, [1.0; 3], false, t0 + Duration::from_millis(1600));
+        let h = e.recent.get("weather.rain").unwrap();
+        assert!(h.playing(t0 + Duration::from_millis(1700)));
+        assert!(!h.playing(t0 + Duration::from_secs(3)));
+        assert_eq!(h.position, [1.0; 3]);
+        assert_eq!(h.count, 1);
     }
 
     #[test]
@@ -546,6 +440,11 @@ mod tests {
         assert_eq!(r.len(), RECENT_MAX);
         assert!(r.list().iter().all(|h| h.id != "s.n.0"));
         assert_eq!(r.list()[0].id, format!("s.n.{}", RECENT_MAX + 4));
+        // The index stays in step after evictions.
+        for h in r.list() {
+            assert_eq!(r.get(&h.id).unwrap().id, h.id);
+        }
+        assert!(r.get("s.n.0").is_none());
     }
 
     #[test]
@@ -554,34 +453,24 @@ mod tests {
         let mut e = Engine::default();
         let id = "block.portal.ambient";
         assert_eq!(e.decide(id, 4, [0.0; 3], true, t0).factor, 1.0);
-        e.set_settings(Settings::parse("group block.portal 20\n"));
+        e.settings = Settings::parse("group block.portal 20\n");
         assert!((e.decide(id, 4, [0.0; 3], false, at(t0, 1)).factor - 0.2).abs() < 1e-6);
-        e.set_settings(Settings::parse("group block.portal 20\nsound block.portal.ambient 0\n"));
+        e.settings = Settings::parse("group block.portal 20\nsound block.portal.ambient 0\n");
         assert_eq!(e.decide(id, 4, [0.0; 3], false, at(t0, 2)).factor, 0.0);
     }
 
     #[test]
-    fn refresh_nudges_then_restores_category_volumes() {
-        use std::cell::RefCell;
-        let stored = RefCell::new([1.0f32, 1.0, 0.25, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
-        let original = *stored.borrow();
-        let t0 = Instant::now();
-        runtime().refresh = 1;
-        let step = |t: Instant| refresh_step(t, |i| stored.borrow()[i], |v| *stored.borrow_mut() = v);
-        step(t0);
-        let nudged = *stored.borrow();
-        assert_eq!(nudged[0], original[0]);
+    fn nudge_changes_every_category_but_master_by_an_inaudible_amount() {
+        let original = [1.0f32, 1.0, 0.25, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let n = nudged(original, false);
+        let m = nudged(original, true);
+        assert_eq!(n[0], original[0]);
         for i in 1..11 {
-            assert_ne!(nudged[i], original[i]);
-            assert!((nudged[i] - original[i]).abs() < 1e-3);
-            assert!((0.0..=1.0).contains(&nudged[i]));
+            assert_ne!(n[i], original[i]);
+            // A second nudge differs from the first, so the game sees a change again.
+            assert_ne!(m[i], n[i]);
+            assert!((n[i] - original[i]).abs() < 1e-3 && (m[i] - original[i]).abs() < 1e-3);
+            assert!((0.0..=1.0).contains(&n[i]) && (0.0..=1.0).contains(&m[i]));
         }
-        // Held long enough for the next audio tick to notice.
-        step(t0 + Duration::from_millis(50));
-        assert_eq!(*stored.borrow(), nudged);
-        step(t0 + NUDGE_HOLD);
-        assert_eq!(*stored.borrow(), original);
-        step(t0 + NUDGE_HOLD * 2);
-        assert_eq!(*stored.borrow(), original);
     }
 }

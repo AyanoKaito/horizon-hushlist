@@ -1,33 +1,9 @@
 [mod]
 id = "hushlist"
-version = "0.1.0"
-priority = 100
+version = "0.2.0"
 
 [compatibility]
 horizon_revision = "6560641ba51a452f6bc2407baa4eb1b3be517ca8"
 
-[[module]]
-id = "core"
-file = "crates/horizon-client/src/sound_playback.rs"
-name = "hushlist"
-source = "core.rs"
-
-[[injection]]
-id = "register-mod"
-kind = "HEAD"
-target = "horizon_client::game::native_hooks::Game<'_>::native_mods"
-helper = "register.rs"
-bindings = [
-  { name = "mods", ty = "&mut Vec<crate::game::native_hooks::NativeMod>", value = "mods" },
-]
-
-[[injection]]
-id = "sound-play"
-kind = "HEAD"
-target = "horizon_client_lib::sound_playback::native_sound_play"
-helper = "sound_play.rs"
-bindings = [
-  { name = "sound", ty = "&crate::sound_engine::SoundPlayback<'_>", value = "sound" },
-  { name = "volume", ty = "&mut f32", value = "volume" },
-  { name = "cancel", ty = "&mut bool", value = "cancel" },
-]
+[api]
+path = "api"

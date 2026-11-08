@@ -2,6 +2,32 @@
 
 Dated record of what was checked and what it proved. Each entry separates what was confirmed from what was not.
 
+## 2026-11-08 — Player screen 0.2.0
+
+**Pin:** Horizon Nightly `6560641ba51a452f6bc2407baa4eb1b3be517ca8`.
+
+**Change:** Hushlist is now a trait mod: a Rust package the launcher links into the game, using Horizon's mod hooks instead of source injections. Injected modules are private to the crate they land in, so they could not host a player screen. The sound logic is unchanged.
+
+**Screen:** opened with H. The Recent tab lists sounds heard in the last 5 minutes, grouped by sound family, with a name from the game's subtitles, the sound ID, time since the last play, play count, a speaker button (mute), a volume slider, the percentage and a reset button. Clicking a row plays the sound at the player. Groups of long-playing sounds (weather, music, discs, ambience) start collapsed. A Freeze button stops the list from reordering; while frozen, a bar counts new sounds and shows them when clicked. Icons are the mod's own, drawn into the mod image slot; panels have rounded corners and rows animate to their new places.
+
+**Confirmed:**
+- 26 standalone unit tests passed (settings, groups, recent list, list building and ordering, layout and hit testing).
+- Native build of the game with the mod linked the way the launcher links trait mods.
+- Isolated offscreen run at 1280x720, GUI scale 2, with rain, mobs and a music disc:
+  - H opened the screen and the close button closed it;
+  - the speaker button muted rain and wrote `sound weather.rain 0` to the settings file;
+  - dragging a slider to 30 % wrote that value;
+  - with the list frozen, three new mobs produced a "5 new sounds" bar, and clicking it showed them;
+  - screenshots showed the icons, real sound names, own and inherited volume shades, and the frozen state.
+- The screen keeps groups collapsed while a long sound plays and does not count live volume refreshes as new plays.
+
+**Not confirmed:**
+- The All, Changed and Zones tabs, search and cooldown controls exist in the design only.
+- The reset button was clicked in the run but on a different row than intended; reset was not verified.
+- Frame time with the screen open was not measured.
+- LAN, dedicated servers, other GUI scales and window sizes, gamepad input.
+- The Mods list entry.
+
 ## 2026-11-07 — Technical prototype 0.1.0
 
 **Pin:** Horizon Nightly `6560641ba51a452f6bc2407baa4eb1b3be517ca8` (2026-11-07).

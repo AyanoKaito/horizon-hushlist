@@ -1,0 +1,17 @@
+[package]
+name = "hushlist"
+version = "0.2.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Icon sheet decoding; already in Horizon's Cargo.lock.
+png = "0.18"
+# Reads the game's sounds.json for subtitle keys; already in Horizon's Cargo.lock.
+serde_json = "1"
+# The launcher points this at the Horizon source it builds the game from.
+horizon-client = { git = "https://github.com/horizon-rust/horizon", rev = "6560641ba51a452f6bc2407baa4eb1b3be517ca8" }
