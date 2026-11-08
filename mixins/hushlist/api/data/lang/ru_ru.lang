@@ -217,3 +217,5 @@ zones.min3=Поставьте хотя бы 3 точки
 zones.meta_points=Точек: {n}
 zones.point_delete=Удалить
 zones.point_keep=Оставить
+zones.inside_now=В зоне сейчас
+zones.nobody=никого

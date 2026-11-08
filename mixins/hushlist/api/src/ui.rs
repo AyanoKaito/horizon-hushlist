@@ -869,14 +869,16 @@ pub fn layout(width: f32, height: f32, banner: bool, m: &Measure, st: &ListState
     let y = ((height - h) / 2.0).floor();
     // Inner margin of the panel.
     let pad = 8.0;
-    let close = [x + w - pad - 16.0, y + 6.0, 16.0, 16.0];
-    let profile = [x + 70.0, y + 6.0, m.profile + 14.0, 16.0];
+    // Header line: the profile button, the search field and the close button are as tall as the
+    // footer buttons.
+    let close = [x + w - pad - 20.0, y + 6.0, 20.0, 20.0];
+    let profile = [x + 70.0, y + 6.0, m.profile + 16.0, 20.0];
     let search_x = profile[0] + profile[2] + 6.0;
-    let search = [search_x, y + 6.0, (close[0] - 8.0 - search_x).max(40.0), 16.0];
-    let search_clear = [search[0] + search[2] - 16.0, search[1], 16.0, 16.0];
-    let tabs = [x + pad, y + 28.0, w - 2.0 * pad, 16.0];
-    let zone_bar = m.zone_bar.then(|| [x + pad, y + 48.0, w - 2.0 * pad, 12.0]);
-    let tools_top = y + 52.0 + if m.zone_bar { 16.0 } else { 0.0 };
+    let search = [search_x, y + 6.0, (close[0] - 8.0 - search_x).max(40.0), 20.0];
+    let search_clear = [search[0] + search[2] - 18.0, search[1], 18.0, 20.0];
+    let tabs = [x + pad, y + 32.0, w - 2.0 * pad, 16.0];
+    let zone_bar = m.zone_bar.then(|| [x + pad, y + 52.0, w - 2.0 * pad, 12.0]);
+    let tools_top = y + 56.0 + if m.zone_bar { 16.0 } else { 0.0 };
     let mut tab_rects = [[0.0; 4]; 4];
     let mut tx = m.tab_lead.unwrap_or(tabs[0] + 2.0);
     for (i, tw) in m.tabs.iter().enumerate() {
@@ -910,7 +912,8 @@ pub fn layout(width: f32, height: f32, banner: bool, m: &Measure, st: &ListState
         r
     });
     let foot_y = y + h - pad - 20.0;
-    let freeze = [x + w - pad - 92.0, foot_y, 92.0, 20.0];
+    // In the middle of the footer, where it is easy to find.
+    let freeze = [x + ((w - 92.0) / 2.0).floor(), foot_y, 92.0, 20.0];
     let mut sort_menu = Vec::new();
     if let (Some(s), true) = (sort, st.sort_open) {
         let mw = m.sort_items.iter().copied().fold(80.0, f32::max) + 18.0;
@@ -926,7 +929,7 @@ pub fn layout(width: f32, height: f32, banner: bool, m: &Measure, st: &ListState
     let confirm_yes = confirm_no.map(|n| [n[0] - 5.0 - yes_w, foot_y, yes_w, 20.0]);
     Layout {
         panel: [x, y, w, h],
-        title: [x + pad + 2.0, y + 10.0],
+        title: [x + pad + 2.0, y + 12.5],
         search,
         search_clear,
         close,

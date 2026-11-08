@@ -197,9 +197,9 @@ const BUTTON_GAP: f32 = 5.0;
 pub fn page_layout(panel: Rect, m: &PageMeasure, profiles: &Profiles, st: &PageState) -> PageLayout {
     let [x, y, w, h] = panel;
     let pad = 8.0;
-    let back = [x + pad, y + 28.0, m.back + BUTTON_PAD, 18.0];
+    let back = [x + pad, y + 32.0, m.back + BUTTON_PAD, 18.0];
     let title = [back[0] + back[2] + 8.0, back[1] + 5.0];
-    let top = y + 54.0;
+    let top = y + 58.0;
     let foot_y = y + h - pad - BUTTON_H;
     let mut items = Vec::new();
     for i in 0..profiles.list.len() {

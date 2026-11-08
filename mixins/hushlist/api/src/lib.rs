@@ -28,6 +28,12 @@ const BORDERS_KEY: &str = "borders";
 const NO_KEY: &str = "key.keyboard.unknown";
 /// Borders are drawn for zones whose edge is this close to the player, in blocks.
 const BORDERS_NEAR: u32 = 96;
+/// Music and discs play without live updates, so the mod asks the game this often whether they
+/// still play: an inaudible nudge of those two category volumes makes the game re-apply every
+/// playing sound of them through the sound hook.
+const PROBE_EVERY: Duration = Duration::from_millis(400);
+/// SoundSource indices probed: music, record.
+const PROBED: [usize; 2] = [1, 2];
 /// Saved this long after the last change, so a slider drag writes once.
 const SAVE_DELAY: Duration = Duration::from_millis(400);
 /// How long the nudged category volumes stay before they are restored.
@@ -160,6 +166,9 @@ struct State {
     head: Option<HeadLayout>,
     /// Zone borders are shown in the world.
     borders: bool,
+    /// Music and record volumes saved while they are nudged for one tick, and the next probe time.
+    probe: Option<[f32; 2]>,
+    next_probe: Option<Instant>,
     /// Widths of the corner menu's "Delete" and "Keep", as last drawn (for test scripts).
     menu_widths: (f32, f32),
     /// Border walls of the nearby zones with their colours, what they were built for, and when.
@@ -926,7 +935,13 @@ impl State {
                 EditorHit::Map => self.point_drag = e.press_map(el.map, mouse),
                 EditorHit::Near => e.far = false,
                 EditorHit::Far => e.far = true,
-                EditorHit::Slider => e.r = zn::slider_radius(el.slider, mouse[0]),
+                EditorHit::Slider => {
+                    e.r = zn::slider_radius(el.slider, mouse[0]);
+                    // A circle wider than the near map switches the map to far.
+                    if e.r > 30 {
+                        e.far = true;
+                    }
+                }
                 _ => {}
             }
             return;
@@ -1383,6 +1398,17 @@ impl Hooks for Hushlist {
         if st.dirty_at.is_some_and(|t| now.saturating_duration_since(t) >= SAVE_DELAY) {
             st.save();
         }
+        // Undo last tick's probe first, so a settings refresh never saves nudged volumes.
+        if let Some(saved) = st.probe.take() {
+            let mut v = [0.0f32; 11];
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = horizon_client::settings::source_volume(i);
+            }
+            for (k, i) in PROBED.iter().enumerate() {
+                v[*i] = saved[k];
+            }
+            horizon_client::settings::set_source_volumes(v);
+        }
         st.refresh = match std::mem::take(&mut st.refresh) {
             Refresh::Pending => {
                 let mut volumes = [0.0f32; 11];
@@ -1402,6 +1428,19 @@ impl Hooks for Hushlist {
             }
             other => other,
         };
+        if matches!(st.refresh, Refresh::Idle) && host.player().is_some() && st.next_probe.is_none_or(|t| now >= t) {
+            st.next_probe = Some(now + PROBE_EVERY);
+            let mut v = [0.0f32; 11];
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = horizon_client::settings::source_volume(i);
+            }
+            let saved = PROBED.map(|i| v[i]);
+            for i in PROBED {
+                v[i] = if v[i] > 0.5 { v[i] - 1.0e-4 } else { v[i] + 1.0e-4 };
+            }
+            horizon_client::settings::set_source_volumes(v);
+            st.probe = Some(saved);
+        }
     }
 
     fn sound_play(&self, event: &mut SoundPlayEvent<'_>) -> Flow {
@@ -1700,6 +1739,9 @@ impl Hooks for Hushlist {
                     e.move_point(i, el.map, event.screen.mouse);
                 } else if slider {
                     e.r = zn::slider_radius(el.slider, event.screen.mouse[0]);
+                    if e.r > 30 {
+                        e.far = true;
+                    }
                 }
             }
             return Flow::Cancel;
@@ -1852,6 +1894,12 @@ impl Hooks for Hushlist {
     }
 }
 
+/// Where text goes in a box of height `r[3]`: the game font's capitals are 7 pixels high, so this
+/// centres them; lowercase letters sit on the same line in every button, chip and tab.
+fn ty(r: Rect) -> f32 {
+    r[1] + (r[3] - 7.0) / 2.0
+}
+
 fn argb(rgb: u32) -> u32 {
     0xFF00_0000 | rgb
 }
@@ -1942,8 +1990,8 @@ fn dump_rows(st: &mut State, rows: &[Row], lay: &ui::Layout, now: Instant) {
         .into_iter()
         .map(|(i, r)| {
             format!(
-                "{{\"id\":\"{}\",\"child\":{},\"own\":{},\"volume\":{},\"count\":{},\"cooldown\":{},\"name\":{:?},\"rect\":[{},{},{},{}]}}",
-                row_id(&rows[i]), rows[i].child, rows[i].own, rows[i].volume, rows[i].count, rows[i].cooldown,
+                "{{\"id\":\"{}\",\"child\":{},\"own\":{},\"volume\":{},\"count\":{},\"cooldown\":{},\"playing\":{},\"name\":{:?},\"rect\":[{},{},{},{}]}}",
+                row_id(&rows[i]), rows[i].child, rows[i].own, rows[i].volume, rows[i].count, rows[i].cooldown, rows[i].playing,
                 match &rows[i].key {
                     Key::Group(g) => group_name(g),
                     Key::Sound(s) => sound_name(&st.subtitles, s),
@@ -2028,7 +2076,7 @@ fn tab_label(tab: Tab, counts: &[usize; 4]) -> String {
 fn button(host: &dyn Host, b: &mut HudBatch, r: Rect, label: &str, rgb: u32, edge: u32, hover: bool) {
     rrect(host, b, r, 3.0, if hover { mix(edge, 0xFF_FF_FF_FF, 0.25) } else { edge });
     rrect(host, b, [r[0] + 1.0, r[1] + 1.0, r[2] - 2.0, r[3] - 2.0], 2.0, argb(if hover { 0x24_22_2C } else { 0x16_15_1B }));
-    host.text(b, label, [r[0] + (r[2] - host.text_width(label)) / 2.0, r[1] + 6.0], rgb, false);
+    host.text(b, label, [r[0] + (r[2] - host.text_width(label)) / 2.0, ty(r)], rgb, false);
 }
 
 /// The Changed tab's footer: how many changes, and "Reset all" with its confirmation.
@@ -2091,7 +2139,7 @@ fn draw_sort_menu(st: &State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
         if on || hover {
             rrect(host, b, *r, 3.0, if on { 0x24_FF_FF_FF } else { 0x14_FF_FF_FF });
         }
-        host.text(b, tr(key), [r[0] + 9.0, r[1] + 4.0], if on || hover { TEXT } else { DIM }, false);
+        host.text(b, tr(key), [r[0] + 9.0, ty(*r)], if on || hover { TEXT } else { DIM }, false);
     }
 }
 
@@ -2131,7 +2179,7 @@ fn draw_page(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layout
             let t = [right - tw - 12.0, r[1] + 8.0, tw + 12.0, 14.0];
             rrect(host, b, t, 7.0, 0x66_6F_F0_DA);
             rrect(host, b, [t[0] + 1.0, t[1] + 1.0, t[2] - 2.0, t[3] - 2.0], 6.0, argb(if sel { 0x26_25_2E } else { 0x1B_1A_20 }));
-            host.text(b, tag, [t[0] + 6.0, t[1] + 3.0], OWN, false);
+            host.text(b, tag, [t[0] + 6.0, ty(t)], OWN, false);
             right = t[0] - 8.0;
         }
         let name_room = right - r[0] - 10.0;
@@ -2145,9 +2193,9 @@ fn draw_page(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layout
                 chars.next();
                 shown = chars.as_str();
             }
-            host.text(b, shown, [f[0] + 4.0, f[1] + 3.0], TEXT, false);
+            host.text(b, shown, [f[0] + 4.0, ty(f)], TEXT, false);
             if (now_ms / 530) % 2 == 0 {
-                host.fill(b, [f[0] + 5.0 + host.text_width(shown), f[1] + 3.0, 1.0, 8.0], argb(TEXT));
+                host.fill(b, [f[0] + 5.0 + host.text_width(shown), ty(f), 1.0, 7.0], argb(TEXT));
             }
         } else {
             host.text(b, &fit(host, &st.profile_name(i), name_room), [r[0] + 10.0, r[1] + 6.0], TEXT, false);
@@ -2316,9 +2364,9 @@ fn draw_zone_head(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::L
         let label = if *tab == Tab::Recent { tr("zones.here") } else { tr(tab_key(*tab)) };
         let active = *tab == st.list.tab;
         let rgb = if active || ui::contains(r, mouse) { TEXT } else { DIM };
-        host.text(b, label, [x, t[1] + 3.0], rgb, false);
+        host.text(b, label, [x, ty(t)], rgb, false);
         if let Some(n) = tab_count(*tab, &st.counts) {
-            host.text(b, &n.to_string(), [x + host.text_width(label) + host.text_width(" "), t[1] + 3.0], FAINT, false);
+            host.text(b, &n.to_string(), [x + host.text_width(label) + host.text_width(" "), ty(t)], FAINT, false);
         }
         if active {
             rrect(host, b, [x - 1.0, t[1] + t[3] - 2.0, r[2] - 4.0, 2.0], 1.0, argb(TEXT));
@@ -2330,7 +2378,7 @@ fn draw_zone_head(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::L
         let hover = ui::contains(r, mouse);
         rrect(host, b, r, 3.0, if hover { mix(edge, 0xFF_FF_FF_FF, 0.25) } else { edge });
         rrect(host, b, [r[0] + 1.0, r[1] + 1.0, r[2] - 2.0, r[3] - 2.0], 2.0, argb(if hover { 0x24_22_2C } else { 0x16_15_1B }));
-        host.text(b, tr(key), [r[0] + (r[2] - host.text_width(tr(key))) / 2.0, r[1] + 4.0], rgb, false);
+        host.text(b, tr(key), [r[0] + (r[2] - host.text_width(tr(key))) / 2.0, ty(r)], rgb, false);
     };
     small(host, b, head.edit, "zones.edit", false);
     small(host, b, head.delete, "zones.delete", true);
@@ -2342,7 +2390,7 @@ fn draw_zone_head(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::L
         } else {
             (tr("zones.bar").replace("{name}", &zone.name), DIM)
         };
-        host.text(b, &fit(host, &text, bar[2] - 4.0), [bar[0] + 2.0, bar[1] + 2.0], rgb, false);
+        host.text(b, &fit(host, &text, bar[2] - 4.0), [bar[0] + 2.0, ty(bar)], rgb, false);
     }
     st.head = Some(head);
 }
@@ -2410,7 +2458,7 @@ fn draw_zones(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
                 if ui::contains(r, mouse) {
                     rrect(host, b, r, 2.0, 0x24_FF_FF_FF);
                 }
-                host.text(b, l, [r[0] + 6.0, r[1] + 3.0], rgb, false);
+                host.text(b, l, [r[0] + 6.0, ty(r)], rgb, false);
             }
         }
         let title = tr(if e.id.is_some() { "zones.title_edit" } else { "zones.title_new" });
@@ -2425,9 +2473,9 @@ fn draw_zones(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
             chars.next();
             shown = chars.as_str();
         }
-        host.text(b, shown, [f[0] + 5.0, f[1] + 4.0], TEXT, false);
+        host.text(b, shown, [f[0] + 5.0, ty(f)], TEXT, false);
         if e.typing && (now_ms / 530) % 2 == 0 {
-            host.fill(b, [f[0] + 6.0 + host.text_width(shown), f[1] + 4.0, 1.0, 8.0], argb(TEXT));
+            host.fill(b, [f[0] + 6.0 + host.text_width(shown), ty(f), 1.0, 7.0], argb(TEXT));
         }
         // A row of joined buttons, one of them on.
         let seg = |host: &dyn Host, b: &mut HudBatch, parts: &[(Rect, &str)], on: usize| {
@@ -2439,7 +2487,7 @@ fn draw_zones(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
             rrect(host, b, [r[0] + 1.0, r[1] + 1.0, r[2] - 2.0, r[3] - 2.0], 2.0, 0x30_FF_FF_FF);
             for (k, (r, l)) in parts.iter().enumerate() {
                 let rgb = if k == on || ui::contains(*r, mouse) { TEXT } else { DIM };
-                host.text(b, l, [r[0] + (r[2] - host.text_width(l)) / 2.0, r[1] + 4.0], rgb, false);
+                host.text(b, l, [r[0] + (r[2] - host.text_width(l)) / 2.0, ty(*r)], rgb, false);
             }
         };
         let shape_on = match e.shape {
@@ -2477,6 +2525,52 @@ fn draw_zones(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
             host.text(b, &i18n::with_n(&code, "zones.area", e.area()), el.area_at, DIM, false);
         } else {
             host.text(b, tr("zones.min3"), el.area_at, AMBER, false);
+        }
+        // Who is in the zone now: mobs and animals the client knows, by kind, most first.
+        let mut kinds: Vec<(String, usize)> = Vec::new();
+        for ent in host.client_entities() {
+            let kind = ent.kind.trim_start_matches("minecraft:");
+            let skip = ent.player_uuid.is_some()
+                || !ent.alive
+                || matches!(kind, "item" | "experience_orb" | "falling_block" | "item_frame" | "glow_item_frame" | "painting" | "armor_stand" | "marker" | "area_effect_cloud")
+                || kind.contains("arrow")
+                || kind.ends_with("_boat")
+                || kind.ends_with("minecart");
+            let [px, py, pz] = ent.position;
+            let (bx, by, bz) = (px.floor() as i32, py.floor() as i32, pz.floor() as i32);
+            if skip || by < e.low || by > e.high || !e.holds_column(bx, bz) {
+                continue;
+            }
+            let name = lang::get_or(&format!("entity.minecraft.{kind}"), &humanize(kind));
+            match kinds.iter_mut().find(|(n, _)| *n == name) {
+                Some(k) => k.1 += 1,
+                None => kinds.push((name, 1)),
+            }
+        }
+        kinds.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let now_at = [el.area_at[0], el.area_at[1] + 16.0];
+        host.text(b, tr("zones.inside_now"), now_at, DIM, false);
+        let mut cx = now_at[0];
+        let mut cy = now_at[1] + 12.0;
+        if kinds.is_empty() {
+            host.text(b, tr("zones.nobody"), [cx, cy + 3.5], FAINT, false);
+        }
+        let right = area[0] + area[2];
+        for (name, n) in &kinds {
+            let label = format!("{name} {n}");
+            let w = host.text_width(&label) + 12.0;
+            if cx + w > right && cx > now_at[0] {
+                cx = now_at[0];
+                cy += 18.0;
+            }
+            if cy + 14.0 > el.save[1] - 6.0 {
+                break;
+            }
+            let r = [cx, cy, w, 14.0];
+            rrect(host, b, r, 7.0, 0x14_FF_FF_FF);
+            host.text(b, name, [r[0] + 6.0, ty(r)], TEXT, false);
+            host.text(b, &n.to_string(), [r[0] + 6.0 + host.text_width(name) + host.text_width(" "), ty(r)], DIM, false);
+            cx += w + 4.0;
         }
         if e.complete() {
             button(host, b, el.save, tr("zones.save"), OWN, 0xC0_6F_F0_DA, ui::contains(el.save, mouse));
@@ -2536,6 +2630,10 @@ fn draw_zones(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
         let room = right - sw.max(host.text_width(&changed)) - 12.0 - (r[0] + 28.0);
         host.text(b, &fit(host, &z.name, room), [r[0] + 28.0, r[1] + 6.0], TEXT, false);
         host.text(b, &fit(host, &zone_meta(&code, &z), room), [r[0] + 28.0, r[1] + 18.0], FAINT, false);
+    }
+    if zn::list_max_scroll(wz.len(), ll.area) > st.zscroll + 0.5 {
+        let a = ll.area;
+        host.fill(b, [a[0], a[1] + a[3] + 2.0, a[2], 1.0], EDGE);
     }
     dump_zones(st, Some(&ll), None, now_ms);
 }
@@ -2621,14 +2719,14 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
     rrect(host, b, p, 7.0, fade(BG, open_alpha));
     host.fill(b, [p[0] + 6.0, p[1], p[2] - 12.0, 1.0], fade(EDGE, open_alpha));
 
-    host.fill(b, [lay.title[0], lay.title[1] + 2.0, 4.0, 4.0], argb(AMBER));
+    host.fill(b, [lay.title[0], lay.title[1] + 1.5, 4.0, 4.0], argb(AMBER));
     host.text(b, "Hushlist", [lay.title[0] + 9.0, lay.title[1]], TEXT, false);
     let close_hover = ui::contains(lay.close, mouse);
     if close_hover {
         rrect(host, b, lay.close, 3.0, ROW_HOVER);
     }
     let close_tone = if close_hover { Tone::Text } else { Tone::Dim };
-    icon(host, b, Icon::Close, close_tone, [lay.close[0] + 2.0, lay.close[1], ICON_SIZE, lay.close[3]]);
+    icon(host, b, Icon::Close, close_tone, [lay.close[0] + 4.0, lay.close[1], ICON_SIZE, lay.close[3]]);
 
     // Profile button: opens the profiles page, and goes back from it.
     let pr = lay.profile;
@@ -2636,7 +2734,7 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
     rrect(host, b, pr, 3.0, if p_hot { 0x40_FF_FF_FF } else { EDGE });
     let p_fill = argb(if st.page.open { 0x2E_2C_36 } else { 0x16_15_1B });
     rrect(host, b, [pr[0] + 1.0, pr[1] + 1.0, pr[2] - 2.0, pr[3] - 2.0], 2.0, p_fill);
-    host.text(b, &st.profile_label(host), [pr[0] + 7.0, pr[1] + 4.0], if p_hot { TEXT } else { DIM }, false);
+    host.text(b, &st.profile_label(host), [pr[0] + 7.0, ty(pr)], if p_hot { TEXT } else { DIM }, false);
 
     if st.page.open {
         draw_page(st, host, b, &lay, mouse, now, now_ms);
@@ -2657,7 +2755,7 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
     if st.list.query.is_empty() {
         if !focus {
             let ph = fit(host, tr("search.placeholder"), room);
-            host.text(b, &ph, [tx, s[1] + 4.0], FAINT, false);
+            host.text(b, &ph, [tx, ty(s)], FAINT, false);
         }
     } else {
         let mut shown: &str = &st.list.query;
@@ -2666,10 +2764,10 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
             chars.next();
             shown = chars.as_str();
         }
-        host.text(b, shown, [tx, s[1] + 4.0], TEXT, false);
+        host.text(b, shown, [tx, ty(s)], TEXT, false);
         let clear_hover = ui::contains(lay.search_clear, mouse);
         let tone = if clear_hover { Tone::Text } else { Tone::Faint };
-        icon(host, b, Icon::Close, tone, [lay.search_clear[0] + 2.0, s[1], ICON_SIZE, s[3]]);
+        icon(host, b, Icon::Close, tone, [lay.search_clear[0] + 3.0, s[1], ICON_SIZE, s[3]]);
     }
     if focus && (now_ms / 530) % 2 == 0 {
         let mut shown: &str = &st.list.query;
@@ -2679,7 +2777,7 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
             shown = chars.as_str();
         }
         let cx = tx + host.text_width(shown) + 1.0;
-        host.fill(b, [cx, s[1] + 4.0, 1.0, 8.0], argb(TEXT));
+        host.fill(b, [cx, ty(s), 1.0, 7.0], argb(TEXT));
     }
 
     // Tabs with counts; inside a zone, its header and sub-tabs instead.
@@ -2701,10 +2799,10 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
         } else {
             DIM
         };
-        host.text(b, label, [x, t[1] + 3.0], rgb, false);
+        host.text(b, label, [x, ty(t)], rgb, false);
         if let Some(n) = tab_count(*tab, &st.counts) {
             let n = n.to_string();
-            host.text(b, &n, [x + host.text_width(label) + host.text_width(" "), t[1] + 3.0], FAINT, false);
+            host.text(b, &n, [x + host.text_width(label) + host.text_width(" "), ty(t)], FAINT, false);
         }
         if active {
             rrect(host, b, [x - 1.0, t[1] + t[3] - 2.0, r[2] - 4.0, 2.0], 1.0, argb(TEXT));
@@ -2730,7 +2828,7 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
             rrect(host, b, [r[0] + 1.0, r[1] + 1.0, r[2] - 2.0, r[3] - 2.0], 6.0, argb(0x16_15_1B));
             if hover { TEXT } else { DIM }
         };
-        host.text(b, label, [r[0] + 7.0, r[1] + 3.0], rgb, false);
+        host.text(b, label, [r[0] + 7.0, ty(*r)], rgb, false);
     }
     // View: flat list or groups, a two-part switch.
     let (vf, vg) = (lay.view_flat, lay.view_group);
@@ -2757,9 +2855,9 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
             rrect(host, b, r, 3.0, 0x14_FF_FF_FF);
         }
         let text = i18n::with_n(&code, if fresh == 1 { "banner.new.one" } else { "banner.new.other" }, fresh);
-        host.text(b, &text, [r[0] + 8.0, r[1] + 4.0], AMBER, false);
+        host.text(b, &text, [r[0] + 8.0, ty(r)], AMBER, false);
         let hint = tr("banner.hint");
-        host.text(b, hint, [r[0] + r[2] - host.text_width(hint) - 8.0, r[1] + 4.0], DIM, false);
+        host.text(b, hint, [r[0] + r[2] - host.text_width(hint) - 8.0, ty(r)], DIM, false);
     }
 
     if rows.is_empty() && st.list.tab == Tab::Changed && !st.list.filtering() {
@@ -2780,20 +2878,21 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
 
     let list = lay.list;
     st.badges.clear();
-    let had_rows = !st.anim.y.is_empty();
     let mut seen = std::collections::HashSet::new();
-    for (i, target) in ui::visible(rows.len(), list, st.list.scroll) {
+    let scroll = st.list.scroll;
+    for (i, target) in ui::visible(rows.len(), list, scroll) {
         let row = &rows[i];
         let id = row_id(row);
         seen.insert(id.clone());
-        // Rows glide to their new place; a row added later slides in from slightly above.
-        let first = !st.anim.y.contains_key(&id);
-        let from = if first && had_rows { target[1] - 6.0 } else { target[1] };
-        let y = approach(*st.anim.y.get(&id).unwrap_or(&from), target[1], dt, 14.0);
-        st.anim.y.insert(id.clone(), y);
-        let start_reveal = if first && had_rows { 0.0 } else { 1.0 };
-        let reveal = approach(*st.anim.reveal.get(&id).unwrap_or(&start_reveal), 1.0, dt, 12.0);
-        st.anim.reveal.insert(id.clone(), reveal);
+        // Rows glide to a new place in the list when the order changes. The place is kept in
+        // list coordinates, so scrolling moves rows at once, and a row that comes into view
+        // simply appears where it belongs.
+        let goal = target[1] + scroll;
+        let at = approach(*st.anim.y.get(&id).unwrap_or(&goal), goal, dt, 14.0);
+        st.anim.y.insert(id.clone(), at);
+        let reveal = 1.0;
+        // Whole pixels, so text and icons move together and nothing shifts when the row settles.
+        let y = (at - scroll).round();
         if y < list[1] - 1.0 || y + ui::ROW_H > list[1] + list[3] + 1.0 {
             continue;
         }
@@ -2862,7 +2961,7 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
             rrect(host, b, btn, 3.0, edge);
             rrect(host, b, [btn[0] + 1.0, btn[1] + 1.0, btn[2] - 2.0, btn[3] - 2.0], 2.0, fade(mix(BG, ROW_HOVER, h), reveal));
             let rgb = if hover { TEXT } else { DIM };
-            host.text(b, &label, [btn[0] + 8.0, btn[1] + 4.0], rgb, false);
+            host.text(b, &label, [btn[0] + 8.0, ty(btn)], rgb, false);
             continue;
         }
         rrect(host, b, bg_rect, 3.0, fade(bg, reveal));
@@ -2994,6 +3093,10 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
             icon(host, b, Icon::Timer, tone, [c.timer[0] + 1.0, c.timer[1], ICON_SIZE, c.timer[3]]);
         }
     }
+    // A thin line at the bottom edge of the list while more rows wait below it.
+    if ui::max_scroll(rows.len(), list) > st.list.scroll + 0.5 {
+        host.fill(b, [list[0], list[1] + list[3] + 2.0, list[2], 1.0], EDGE);
+    }
     dump_rows(st, &rows, &lay, now);
     st.anim.y.retain(|k, _| seen.contains(k));
     st.anim.reveal.retain(|k, _| seen.contains(k));
@@ -3016,5 +3119,5 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
     let (label_rgb, tone) = if st.anim.freeze > 0.5 { (ICE_TEXT, Tone::IceText) } else { (TEXT, Tone::Text) };
     icon(host, b, Icon::Snowflake, tone, [f[0] + 6.0, f[1], ICON_SIZE, f[3]]);
     let label = if st.list.frozen { tr("freeze.on") } else { tr("freeze.off") };
-    host.text(b, label, [f[0] + 22.0, f[1] + 6.0], label_rgb, false);
+    host.text(b, label, [f[0] + 22.0, ty(f)], label_rgb, false);
 }

@@ -98,9 +98,10 @@ def draw(name):
         for y in (7, 12, 17):
             line(d, [(5, y), (19, y)], 2.0)
     elif name == "view_groups":
-        line(d, [(4.5, 6), (19.5, 6)], 2.4)
-        for y in (11, 15, 19):
-            line(d, [(9, y), (19.5, y)], 1.7)
+        # The same three lines as the list, the two lower ones indented: a group and its sounds.
+        line(d, [(5, 7), (19, 7)], 2.0)
+        for y in (12, 17):
+            line(d, [(10, y), (19, y)], 2.0)
     elif name == "sort":
         line(d, [(8, 4.5), (8, 19)], 1.8)
         line(d, [(4.5, 15.5), (8, 19), (11.5, 15.5)], 1.8)

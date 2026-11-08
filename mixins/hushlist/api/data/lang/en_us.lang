@@ -217,3 +217,5 @@ zones.min3=Place at least 3 points
 zones.meta_points={n} points
 zones.point_delete=Delete
 zones.point_keep=Keep
+zones.inside_now=In the zone now
+zones.nobody=nobody
