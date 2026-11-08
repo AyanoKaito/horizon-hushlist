@@ -983,7 +983,7 @@ fn tab_label(tab: Tab, counts: &[usize; 3]) -> String {
 fn button(host: &dyn Host, b: &mut HudBatch, r: Rect, label: &str, rgb: u32, edge: u32, hover: bool) {
     rrect(host, b, r, 3.0, if hover { mix(edge, 0xFF_FF_FF_FF, 0.25) } else { edge });
     rrect(host, b, [r[0] + 1.0, r[1] + 1.0, r[2] - 2.0, r[3] - 2.0], 2.0, argb(if hover { 0x24_22_2C } else { 0x16_15_1B }));
-    host.text(b, label, [r[0] + (r[2] - host.text_width(label)) / 2.0, r[1] + 5.0], rgb, false);
+    host.text(b, label, [r[0] + (r[2] - host.text_width(label)) / 2.0, r[1] + 6.0], rgb, false);
 }
 
 /// The Changed tab's footer: how many changes, and "Reset all" with its confirmation.
@@ -1042,7 +1042,7 @@ fn draw_sort_menu(st: &State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
         if on || hover {
             rrect(host, b, *r, 3.0, if on { 0x24_FF_FF_FF } else { 0x14_FF_FF_FF });
         }
-        host.text(b, tr(item.key()), [r[0] + 8.0, r[1] + 3.0], if on || hover { TEXT } else { DIM }, false);
+        host.text(b, tr(item.key()), [r[0] + 9.0, r[1] + 4.0], if on || hover { TEXT } else { DIM }, false);
     }
 }
 
@@ -1081,17 +1081,17 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
     st.list.scroll = st.list.scroll.min(ui::max_scroll(rows.len(), lay.list));
     let p = lay.panel;
 
-    rrect(host, b, p, 6.0, fade(BG, open_alpha));
+    rrect(host, b, p, 7.0, fade(BG, open_alpha));
     host.fill(b, [p[0] + 6.0, p[1], p[2] - 12.0, 1.0], fade(EDGE, open_alpha));
 
-    host.fill(b, [lay.title[0], lay.title[1] + 1.0, 4.0, 4.0], argb(AMBER));
-    host.text(b, "Hushlist", [lay.title[0] + 8.0, lay.title[1]], TEXT, false);
+    host.fill(b, [lay.title[0], lay.title[1] + 2.0, 4.0, 4.0], argb(AMBER));
+    host.text(b, "Hushlist", [lay.title[0] + 9.0, lay.title[1]], TEXT, false);
     let close_hover = ui::contains(lay.close, mouse);
     if close_hover {
         rrect(host, b, lay.close, 3.0, ROW_HOVER);
     }
     let close_tone = if close_hover { Tone::Text } else { Tone::Dim };
-    icon(host, b, Icon::Close, close_tone, [lay.close[0] + 1.0, lay.close[1], ICON_SIZE, lay.close[3]]);
+    icon(host, b, Icon::Close, close_tone, [lay.close[0] + 2.0, lay.close[1], ICON_SIZE, lay.close[3]]);
 
     // Search field: placeholder, typed text (its end when long), caret while it has the keyboard.
     let s = lay.search;
@@ -1100,13 +1100,13 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
     let s_edge = if focus { FIELD_EDGE_FOCUS } else if s_hover { 0x38_FF_FF_FF } else { EDGE };
     rrect(host, b, s, 3.0, s_edge);
     rrect(host, b, [s[0] + 1.0, s[1] + 1.0, s[2] - 2.0, s[3] - 2.0], 2.0, FIELD);
-    icon(host, b, Icon::Search, if focus { Tone::Text } else { Tone::Dim }, [s[0] + 3.0, s[1], ICON_SIZE, s[3]]);
-    let tx = s[0] + 18.0;
-    let room = (s[2] - 18.0 - 16.0).max(0.0);
+    icon(host, b, Icon::Search, if focus { Tone::Text } else { Tone::Dim }, [s[0] + 4.0, s[1], ICON_SIZE, s[3]]);
+    let tx = s[0] + 20.0;
+    let room = (s[2] - 20.0 - 18.0).max(0.0);
     if st.list.query.is_empty() {
         if !focus {
             let ph = fit(host, tr("search.placeholder"), room);
-            host.text(b, &ph, [tx, s[1] + 3.0], FAINT, false);
+            host.text(b, &ph, [tx, s[1] + 4.0], FAINT, false);
         }
     } else {
         let mut shown: &str = &st.list.query;
@@ -1115,10 +1115,10 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
             chars.next();
             shown = chars.as_str();
         }
-        host.text(b, shown, [tx, s[1] + 3.0], TEXT, false);
+        host.text(b, shown, [tx, s[1] + 4.0], TEXT, false);
         let clear_hover = ui::contains(lay.search_clear, mouse);
         let tone = if clear_hover { Tone::Text } else { Tone::Faint };
-        icon(host, b, Icon::Close, tone, [lay.search_clear[0] + 1.0, s[1], ICON_SIZE, s[3]]);
+        icon(host, b, Icon::Close, tone, [lay.search_clear[0] + 2.0, s[1], ICON_SIZE, s[3]]);
     }
     if focus && (now_ms / 530) % 2 == 0 {
         let mut shown: &str = &st.list.query;
@@ -1128,7 +1128,7 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
             shown = chars.as_str();
         }
         let cx = tx + host.text_width(shown) + 1.0;
-        host.fill(b, [cx, s[1] + 3.0, 1.0, 8.0], argb(TEXT));
+        host.fill(b, [cx, s[1] + 4.0, 1.0, 8.0], argb(TEXT));
     }
 
     // Tabs with counts; the ones not built yet are faint and do nothing.
@@ -1147,10 +1147,10 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
         } else {
             DIM
         };
-        host.text(b, label, [x, t[1] + 2.0], rgb, false);
+        host.text(b, label, [x, t[1] + 3.0], rgb, false);
         if let Some(n) = tab_count(*tab, &st.counts) {
             let n = n.to_string();
-            host.text(b, &n, [x + host.text_width(label) + host.text_width(" "), t[1] + 2.0], FAINT, false);
+            host.text(b, &n, [x + host.text_width(label) + host.text_width(" "), t[1] + 3.0], FAINT, false);
         }
         if active {
             rrect(host, b, [x - 1.0, t[1] + t[3] - 2.0, r[2] - 4.0, 2.0], 1.0, argb(TEXT));
@@ -1165,14 +1165,14 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
         let label = tr(ui::category_key(source).unwrap_or_default());
         let hover = ui::contains(*r, mouse);
         let rgb = if st.list.cats.contains(&source) {
-            rrect(host, b, *r, 6.5, argb(TEXT));
+            rrect(host, b, *r, 7.0, argb(TEXT));
             CHIP_ON_TEXT
         } else {
-            rrect(host, b, *r, 6.5, if hover { 0x40_FF_FF_FF } else { EDGE });
-            rrect(host, b, [r[0] + 1.0, r[1] + 1.0, r[2] - 2.0, r[3] - 2.0], 5.5, argb(0x16_15_1B));
+            rrect(host, b, *r, 7.0, if hover { 0x40_FF_FF_FF } else { EDGE });
+            rrect(host, b, [r[0] + 1.0, r[1] + 1.0, r[2] - 2.0, r[3] - 2.0], 6.0, argb(0x16_15_1B));
             if hover { TEXT } else { DIM }
         };
-        host.text(b, label, [r[0] + 6.0, r[1] + 3.0], rgb, false);
+        host.text(b, label, [r[0] + 7.0, r[1] + 3.0], rgb, false);
     }
     // View: flat list or groups, a two-part switch.
     let (vf, vg) = (lay.view_flat, lay.view_group);
@@ -1183,13 +1183,13 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
     rrect(host, b, [on[0] + 1.0, on[1] + 1.0, on[2] - 2.0, on[3] - 2.0], 2.0, 0x30_FF_FF_FF);
     for (r, ic, active) in [(vf, Icon::ViewList, st.list.flat), (vg, Icon::ViewGroups, !st.list.flat)] {
         let tone = if active || ui::contains(r, mouse) { Tone::Text } else { Tone::Dim };
-        icon(host, b, ic, tone, [r[0] + 2.0, r[1], ICON_SIZE, r[3]]);
+        icon(host, b, ic, tone, [r[0] + 3.0, r[1], ICON_SIZE, r[3]]);
     }
     if let Some(s) = lay.sort {
         let hot = st.list.sort_open || ui::contains(s, mouse);
         rrect(host, b, s, 3.0, if hot { 0x40_FF_FF_FF } else { EDGE });
         rrect(host, b, [s[0] + 1.0, s[1] + 1.0, s[2] - 2.0, s[3] - 2.0], 2.0, argb(if st.list.sort_open { 0x2E_2C_36 } else { 0x16_15_1B }));
-        icon(host, b, Icon::Sort, if hot { Tone::Text } else { Tone::Dim }, [s[0] + 2.0, s[1], ICON_SIZE, s[3]]);
+        icon(host, b, Icon::Sort, if hot { Tone::Text } else { Tone::Dim }, [s[0] + 3.0, s[1], ICON_SIZE, s[3]]);
     }
 
     st.anim.banner = approach(st.anim.banner, if lay.banner.is_some() { 1.0 } else { 0.0 }, dt, 16.0);
@@ -1199,9 +1199,9 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
             rrect(host, b, r, 3.0, 0x14_FF_FF_FF);
         }
         let text = i18n::with_n(&code, if fresh == 1 { "banner.new.one" } else { "banner.new.other" }, fresh);
-        host.text(b, &text, [r[0] + 6.0, r[1] + 3.0], AMBER, false);
+        host.text(b, &text, [r[0] + 8.0, r[1] + 4.0], AMBER, false);
         let hint = tr("banner.hint");
-        host.text(b, hint, [r[0] + r[2] - host.text_width(hint) - 6.0, r[1] + 3.0], DIM, false);
+        host.text(b, hint, [r[0] + r[2] - host.text_width(hint) - 8.0, r[1] + 4.0], DIM, false);
     }
 
     if rows.is_empty() && st.list.tab == Tab::Changed && !st.list.filtering() {
@@ -1260,10 +1260,10 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
             let left = if row.child { r[0] + ui::CHILD_INDENT } else { r[0] };
             rrect(host, b, [left, r[1] - ui::ROW_GAP, r[0] + r[2] - left, r[3] + ui::ROW_GAP], 3.0, fade(ROW, reveal));
             let label = tr("cooldown.label");
-            host.text(b, label, [c.name[0], r[1] + 7.0], TEXT, false);
+            host.text(b, label, [c.name[0], r[1] + ui::MID_Y], TEXT, false);
             let value = ui::cooldown_text(row.cooldown, &code);
             let vrgb = if row.cooldown > 0 { OWN } else { DIM };
-            host.text(b, &value, [c.name[0] + host.text_width(label) + 8.0, r[1] + 7.0], vrgb, false);
+            host.text(b, &value, [c.name[0] + host.text_width(label) + 8.0, r[1] + ui::MID_Y], vrgb, false);
             let s = c.slider;
             let cy = (s[1] + s[3] / 2.0).floor();
             let steps = (ui::RATES.len() - 1) as f32;
@@ -1285,7 +1285,7 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
             );
             if row.cooldown > 0 {
                 if hover && ui::contains(c.reset, mouse) {
-                    rrect(host, b, [c.reset[0] - 1.0, r[1] + 3.0, 16.0, r[3] - 6.0], 3.0, ROW_HOVER);
+                    rrect(host, b, [c.reset[0] - 1.0, r[1] + 4.0, 16.0, r[3] - 8.0], 3.0, ROW_HOVER);
                 }
                 icon(host, b, Icon::Reset, Tone::Own, [c.reset[0] + 1.0, c.reset[1], ICON_SIZE, c.reset[3]]);
             }
@@ -1299,12 +1299,12 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
                 i18n::with_n(&code, "group.more", row.count)
             };
             let w = host.text_width(&label) + 16.0;
-            let btn = [c.name[0] - 4.0, r[1] + 4.0, w, r[3] - 8.0];
+            let btn = [c.name[0] - 4.0, r[1] + 5.0, w, r[3] - 10.0];
             let edge = fade(mix(EDGE, 0xFF_FF_FF_FF, 0.15 * h), reveal);
             rrect(host, b, btn, 3.0, edge);
             rrect(host, b, [btn[0] + 1.0, btn[1] + 1.0, btn[2] - 2.0, btn[3] - 2.0], 2.0, fade(mix(BG, ROW_HOVER, h), reveal));
             let rgb = if hover { TEXT } else { DIM };
-            host.text(b, &label, [btn[0] + 8.0, btn[1] + 3.0], rgb, false);
+            host.text(b, &label, [btn[0] + 8.0, btn[1] + 4.0], rgb, false);
             continue;
         }
         rrect(host, b, bg_rect, 3.0, fade(bg, reveal));
@@ -1346,24 +1346,24 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
         let badge_w = badge.as_ref().map_or(0.0, |t| host.text_width(t) + 10.0);
         let name_room = if badge.is_some() { (c.name[2] - badge_w - 4.0).max(0.0) } else { c.name[2] };
         let shown_name = fit(host, &name, name_room);
-        host.text(b, &shown_name, [c.name[0], r[1] + 3.0], name_rgb, false);
+        host.text(b, &shown_name, [c.name[0], r[1] + ui::NAME_Y], name_rgb, false);
         if let (Some(text), Key::Sound(sid)) = (&badge, &row.key) {
             let bx = c.name[0] + host.text_width(&shown_name) + 4.0;
-            let br = [bx, r[1] + 2.0, badge_w, 10.0];
+            let br = [bx, r[1] + ui::NAME_Y - 1.0, badge_w, 10.0];
             let edge = if ui::contains(br, mouse) { 0x99_6F_F0_DA } else { 0x59_6F_F0_DA };
             rrect(host, b, br, 5.0, edge);
             rrect(host, b, [br[0] + 1.0, br[1] + 1.0, br[2] - 2.0, br[3] - 2.0], 4.0, argb(0x1A_1F_22));
-            host.text(b, text, [bx + 5.0, r[1] + 3.0], OWN, false);
+            host.text(b, text, [bx + 5.0, r[1] + ui::NAME_Y], OWN, false);
             st.badges.push((br, sid.clone()));
         }
-        host.text(b, &fit(host, &detail, c.name[2]), [c.name[0], r[1] + 12.0], FAINT, false);
+        host.text(b, &fit(host, &detail, c.name[2]), [c.name[0], r[1] + ui::DETAIL_Y], FAINT, false);
 
         let when = ui::when_text(row, &code);
         let when_rgb = if row.playing || row.flash { AMBER } else { DIM };
-        host.text(b, &when, [c.when[0] + c.when[2] - host.text_width(&when), r[1] + 3.0], when_rgb, false);
+        host.text(b, &when, [c.when[0] + c.when[2] - host.text_width(&when), r[1] + ui::NAME_Y], when_rgb, false);
         if !row.playing && row.count > 0 {
             let count = format!("×{}", row.count);
-            host.text(b, &count, [c.when[0] + c.when[2] - host.text_width(&count), r[1] + 12.0], FAINT, false);
+            host.text(b, &count, [c.when[0] + c.when[2] - host.text_width(&count), r[1] + ui::DETAIL_Y], FAINT, false);
         }
 
         let (rgb, tone) = if row.volume == 0 {
@@ -1381,7 +1381,7 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
             _ => Icon::SpeakerHigh,
         };
         if hover && ui::contains(c.speaker, mouse) {
-            rrect(host, b, [c.speaker[0] - 2.0, r[1] + 3.0, 16.0, r[3] - 6.0], 3.0, ROW_HOVER);
+            rrect(host, b, [c.speaker[0] - 2.0, r[1] + 4.0, 16.0, r[3] - 8.0], 3.0, ROW_HOVER);
         }
         icon(host, b, speaker, tone, c.speaker);
 
@@ -1410,17 +1410,17 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
         );
 
         let pct = format!("{}%", row.volume);
-        host.text(b, &pct, [c.pct[0] + c.pct[2] - host.text_width(&pct), r[1] + 7.0], rgb, false);
+        host.text(b, &pct, [c.pct[0] + c.pct[2] - host.text_width(&pct), r[1] + ui::MID_Y], rgb, false);
         if row.own {
             if hover && ui::contains(c.reset, mouse) {
-                rrect(host, b, [c.reset[0] - 1.0, r[1] + 3.0, 16.0, r[3] - 6.0], 3.0, ROW_HOVER);
+                rrect(host, b, [c.reset[0] - 1.0, r[1] + 4.0, 16.0, r[3] - 8.0], 3.0, ROW_HOVER);
             }
             icon(host, b, Icon::Reset, Tone::Own, [c.reset[0] + 1.0, c.reset[1], ICON_SIZE, c.reset[3]]);
         }
         if let Key::Sound(sid) = &row.key {
             let timer_hover = hover && ui::contains(c.timer, mouse);
             if timer_hover {
-                rrect(host, b, [c.timer[0] - 1.0, r[1] + 3.0, 16.0, r[3] - 6.0], 3.0, ROW_HOVER);
+                rrect(host, b, [c.timer[0] - 1.0, r[1] + 4.0, 16.0, r[3] - 8.0], 3.0, ROW_HOVER);
             }
             let open = st.list.drawer.as_deref() == Some(sid.as_str());
             let tone = if row.cooldown > 0 {
@@ -1453,7 +1453,7 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
     }
     rrect(host, b, f, 4.0, colour);
     let (label_rgb, tone) = if st.anim.freeze > 0.5 { (ICE_TEXT, Tone::IceText) } else { (TEXT, Tone::Text) };
-    icon(host, b, Icon::Snowflake, tone, [f[0] + 4.0, f[1], ICON_SIZE, f[3]]);
+    icon(host, b, Icon::Snowflake, tone, [f[0] + 6.0, f[1], ICON_SIZE, f[3]]);
     let label = if st.list.frozen { tr("freeze.on") } else { tr("freeze.off") };
-    host.text(b, label, [f[0] + 20.0, f[1] + 5.0], label_rgb, false);
+    host.text(b, label, [f[0] + 22.0, f[1] + 6.0], label_rgb, false);
 }

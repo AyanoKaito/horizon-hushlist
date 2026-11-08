@@ -4,10 +4,14 @@
 use crate::core::{Settings, group_key};
 use std::collections::{HashMap, HashSet};
 
-/// One row's height in GUI pixels: a name line and a detail line.
-pub const ROW_H: f32 = 22.0;
+/// One row's height in GUI pixels: a name line and a detail line, with air around them.
+pub const ROW_H: f32 = 26.0;
 /// Gap between rows.
-pub const ROW_GAP: f32 = 2.0;
+pub const ROW_GAP: f32 = 3.0;
+/// Baselines inside a row: name line, detail line, and a single centred line.
+pub const NAME_Y: f32 = 5.0;
+pub const DETAIL_Y: f32 = 15.0;
+pub const MID_Y: f32 = 9.0;
 /// Extra left inset of a sound shown inside its group.
 pub const CHILD_INDENT: f32 = 12.0;
 /// A start counts as fresh (row highlight) this long, in seconds.
@@ -697,7 +701,7 @@ pub struct Layout {
 }
 
 /// Height of a chip and of the view buttons.
-pub const CHIP_H: f32 = 13.0;
+pub const CHIP_H: f32 = 14.0;
 
 /// `m` holds measured text widths; chips wrap onto more lines when they do not fit.
 pub fn layout(width: f32, height: f32, banner: bool, m: &Measure, st: &ListState) -> Layout {
@@ -706,57 +710,60 @@ pub fn layout(width: f32, height: f32, banner: bool, m: &Measure, st: &ListState
     let h = (height - 24.0).max(160.0).min(height);
     let x = ((width - w) / 2.0).floor();
     let y = ((height - h) / 2.0).floor();
-    let close = [x + w - 20.0, y + 4.0, 14.0, 14.0];
-    let search = [x + 70.0, y + 4.0, (close[0] - 6.0 - x - 70.0).max(40.0), 14.0];
-    let search_clear = [search[0] + search[2] - 14.0, search[1], 14.0, 14.0];
-    let tabs = [x + 6.0, y + 22.0, w - 12.0, 14.0];
-    let tools_top = y + 42.0;
+    // Inner margin of the panel.
+    let pad = 8.0;
+    let close = [x + w - pad - 16.0, y + 6.0, 16.0, 16.0];
+    let search = [x + 76.0, y + 6.0, (close[0] - 8.0 - x - 76.0).max(40.0), 16.0];
+    let search_clear = [search[0] + search[2] - 16.0, search[1], 16.0, 16.0];
+    let tabs = [x + pad, y + 28.0, w - 2.0 * pad, 16.0];
+    let tools_top = y + 52.0;
     let mut tab_rects = [[0.0; 4]; 4];
     let mut tx = tabs[0] + 2.0;
     for (i, tw) in m.tabs.iter().enumerate() {
         tab_rects[i] = [tx - 3.0, tabs[1], tw + 6.0, tabs[3]];
-        tx += tw + 14.0;
+        tx += tw + 16.0;
     }
     let sorted_tab = matches!(st.tab, Tab::All | Tab::Changed);
-    let sort = sorted_tab.then(|| [x + w - 6.0 - 16.0, tools_top, 16.0, CHIP_H]);
-    let right = sort.map_or(x + w - 6.0, |s| s[0] - 4.0);
-    let view_group = [right - 16.0, tools_top, 16.0, CHIP_H];
-    let view_flat = [view_group[0] - 16.0, tools_top, 16.0, CHIP_H];
-    let chips_right = view_flat[0] - 8.0;
+    let sort = sorted_tab.then(|| [x + w - pad - 18.0, tools_top, 18.0, CHIP_H]);
+    let right = sort.map_or(x + w - pad, |s| s[0] - 5.0);
+    let view_group = [right - 18.0, tools_top, 18.0, CHIP_H];
+    let view_flat = [view_group[0] - 18.0, tools_top, 18.0, CHIP_H];
+    let chips_right = view_flat[0] - 10.0;
     let mut chips = Vec::with_capacity(chip_text.len());
-    let (mut cx, mut cy) = (x + 6.0, tools_top);
+    let (mut cx, mut cy) = (x + pad, tools_top);
     for tw in chip_text {
-        let cw = tw + 12.0;
-        if cx > x + 6.0 && cx + cw > chips_right {
-            cx = x + 6.0;
-            cy += CHIP_H + 3.0;
+        let cw = tw + 14.0;
+        if cx > x + pad && cx + cw > chips_right {
+            cx = x + pad;
+            cy += CHIP_H + 4.0;
         }
         chips.push([cx, cy, cw, CHIP_H]);
         cx += cw + 4.0;
     }
-    let mut top = cy + CHIP_H + 5.0;
+    let mut top = cy + CHIP_H + 8.0;
     let banner = banner.then(|| {
-        let r = [x + 6.0, top, w - 12.0, 14.0];
-        top += 16.0;
+        let r = [x + pad, top, w - 2.0 * pad, 16.0];
+        top += 19.0;
         r
     });
-    let freeze = [x + w - 92.0, y + h - 22.0, 86.0, 18.0];
+    let foot_y = y + h - pad - 20.0;
+    let freeze = [x + w - pad - 92.0, foot_y, 92.0, 20.0];
     let mut sort_menu = Vec::new();
     if let (Some(s), true) = (sort, st.sort_open) {
-        let mw = m.sort_items.iter().copied().fold(80.0, f32::max) + 16.0;
+        let mw = m.sort_items.iter().copied().fold(80.0, f32::max) + 18.0;
         for i in 0..m.sort_items.len() {
-            sort_menu.push([s[0] + s[2] - mw, s[1] + s[3] + 3.0 + i as f32 * 14.0, mw, 14.0]);
+            sort_menu.push([s[0] + s[2] - mw, s[1] + s[3] + 4.0 + i as f32 * 16.0, mw, 16.0]);
         }
     }
-    let foot_y = y + h - 22.0;
     let changed = st.tab == Tab::Changed;
-    let [reset_w, yes_w, no_w] = m.buttons.map(|b| b + 16.0);
-    let reset_all = (changed && !st.confirm_reset).then(|| [x + w - 6.0 - reset_w, foot_y, reset_w, 18.0]);
-    let confirm_no = (changed && st.confirm_reset).then(|| [x + w - 6.0 - no_w, foot_y, no_w, 18.0]);
-    let confirm_yes = confirm_no.map(|n| [n[0] - 4.0 - yes_w, foot_y, yes_w, 18.0]);
+    let [reset_w, yes_w, no_w] = m.buttons.map(|b| b + 18.0);
+    let right_edge = x + w - pad;
+    let reset_all = (changed && !st.confirm_reset).then(|| [right_edge - reset_w, foot_y, reset_w, 20.0]);
+    let confirm_no = (changed && st.confirm_reset).then(|| [right_edge - no_w, foot_y, no_w, 20.0]);
+    let confirm_yes = confirm_no.map(|n| [n[0] - 5.0 - yes_w, foot_y, yes_w, 20.0]);
     Layout {
         panel: [x, y, w, h],
-        title: [x + 8.0, y + 7.0],
+        title: [x + pad + 2.0, y + 10.0],
         search,
         search_clear,
         close,
@@ -768,10 +775,10 @@ pub fn layout(width: f32, height: f32, banner: bool, m: &Measure, st: &ListState
         sort,
         sort_menu,
         banner,
-        list: [x + 6.0, top, w - 12.0, (y + h - 26.0 - top).max(0.0)],
+        list: [x + pad, top, w - 2.0 * pad, (foot_y - 6.0 - top).max(0.0)],
         freeze,
         show_freeze: st.tab == Tab::Recent,
-        foot_text: [x + 8.0, foot_y + 5.0],
+        foot_text: [x + pad + 2.0, foot_y + 6.0],
         reset_all,
         confirm_yes,
         confirm_no,
@@ -796,14 +803,14 @@ pub struct Cols {
 /// Row parts, right to left. The slider grows with the screen.
 pub fn columns(row: Rect, child: bool) -> Cols {
     let [x, y, w, h] = row;
-    let timer = [x + w - 16.0, y, 14.0, h];
+    let timer = [x + w - 20.0, y, 14.0, h];
     let reset = [timer[0] - 16.0, y, 14.0, h];
     let pct = [reset[0] - 30.0, y, 28.0, h];
     let slider_w = (w * 0.28).clamp(70.0, 170.0);
     let slider = [pct[0] - 4.0 - slider_w, y, slider_w, h];
     let speaker = [slider[0] - 18.0, y, 14.0, h];
     let when = [speaker[0] - 42.0, y, 38.0, h];
-    let left = x + 2.0 + if child { CHILD_INDENT } else { 0.0 };
+    let left = x + 6.0 + if child { CHILD_INDENT } else { 0.0 };
     let ind = [left, y, 12.0, h];
     let name_x = left + 16.0;
     let name = [name_x, y, (when[0] - 4.0 - name_x).max(0.0), h];
