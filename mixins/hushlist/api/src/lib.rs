@@ -4,6 +4,7 @@ mod core;
 mod i18n;
 mod profiles;
 mod ui;
+mod zones;
 
 use crate::core::{Engine, MOD_ID, MOD_VERSION, SETTINGS_FILE, Settings, group_key, normalize, nudged};
 use crate::profiles::{PageHit, PageLayout, PageMeasure, PageState, Profiles};
@@ -13,8 +14,9 @@ use horizon_client::mod_api::{
     ClientTickPostEvent, Flow, Hooks, Host, HudBatch, KeyEvent, ModsEvent, NativeMod,
     ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent, ScreenMouseDraggedPreEvent,
     ScreenCharTypedPreEvent, ScreenKeyPressedPreEvent, ScreenMouseScrolledPreEvent, ScreenRenderPostEvent,
-    SettingsClickEvent, SettingsEvent, SoundPlayEvent,
+    NativeWorldId, SettingsClickEvent, SettingsEvent, SoundPlayEvent,
 };
+use crate::zones::{self as zn, Editor, EditorHit, HeadLayout, Shape, Zone};
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
@@ -134,6 +136,21 @@ struct State {
     profile_counts: std::collections::HashMap<u32, usize>,
     /// The last click on a profile row, to tell a double click.
     last_item_click: Option<(usize, Instant)>,
+    /// The zone whose sounds the list shows, by id.
+    zone_open: Option<u32>,
+    /// The open zone asks to confirm its deletion.
+    zone_confirm: bool,
+    /// The zone being made or reshaped.
+    editor: Option<Editor>,
+    /// The editor's radius slider is held.
+    zone_drag: bool,
+    /// Zone list scroll in GUI pixels.
+    zscroll: f32,
+    /// The player's position at the last tick.
+    player_pos: Option<[f64; 3]>,
+    map: MapState,
+    /// The open zone's header as last drawn, for test scripts.
+    head: Option<HeadLayout>,
     preview: Option<String>,
     drag: Option<Key>,
     trace: Option<std::fs::File>,
@@ -155,7 +172,7 @@ struct State {
     /// Cooldown badges drawn in the last frame, with their sound: a click opens the drawer.
     badges: Vec<(Rect, String)>,
     /// Tab counts: heard recently, sounds in the game, settings.
-    counts: [usize; 3],
+    counts: [usize; 4],
     /// Display names and lowercase search text by row key, for the current language.
     /// The All tab sorts and searches about 2000 sounds; this keeps each frame cheap.
     texts: std::cell::RefCell<Texts>,
@@ -168,6 +185,27 @@ struct Texts {
     lang: String,
     /// Key id (`g:` group, `s:` sound) to (display name, lowercase name + ID + group name).
     by_key: std::collections::HashMap<String, (String, String)>,
+}
+
+/// Side of the editor's map image in pixels.
+const MAP_PX: usize = 512;
+
+/// The zone editor's map: the game's map colours of the blocks around the zone, with the zone painted on.
+#[derive(Default)]
+struct MapState {
+    /// What the terrain was read for: world, north-west column, span in blocks.
+    terrain_key: Option<(String, [i32; 2], i32)>,
+    /// Shaded map colour (0xRRGGBB) per column, rows north to south.
+    terrain: Vec<u32>,
+    /// What the image shows.
+    image_key: Option<String>,
+    /// MAP_PX by MAP_PX RGBA.
+    image: Vec<u8>,
+    /// The image changed since it was sent to the game.
+    upload: bool,
+    /// The image key the game has, and the image's top row in the shared image.
+    uploaded_key: Option<String>,
+    top: f32,
 }
 
 /// Animation state between frames. Positions and alphas ease toward their targets.
@@ -283,8 +321,14 @@ fn decode_icons() -> Option<(u32, u32, Vec<u8>)> {
 
 impl State {
     fn views(&self, now: Instant) -> Vec<HeardView> {
-        self.engine
-            .recent
+        // Inside a zone, "Recent here": the sounds heard from the zone.
+        let zone = self.open_zone_index().filter(|_| self.editor.is_none()).map(|i| self.engine.zones[i].id);
+        let empty = crate::core::Recent::default();
+        let recent = match zone {
+            Some(id) => self.engine.zone_recent.get(&id).unwrap_or(&empty),
+            None => &self.engine.recent,
+        };
+        recent
             .list()
             .into_iter()
             .filter(|h| now.saturating_duration_since(h.alive) <= crate::core::RECENT_WINDOW)
@@ -300,11 +344,18 @@ impl State {
 
     fn rows(&mut self, now: Instant) -> (Vec<HeardView>, Vec<Row>, usize) {
         let views = self.views(now);
-        self.counts = [views.len(), self.catalog.total, self.engine.settings.count()];
+        // Inside a zone the list shows the zone's settings over the profile's.
+        let shown = self.shown_zone_settings();
+        let set_count = shown.as_ref().map_or(self.engine.settings.count(), Settings::count);
+        self.counts = [views.len(), self.catalog.total, set_count, self.world_zones().len()];
+        if self.list.tab == Tab::Zones {
+            return (views, Vec::new(), 0);
+        }
         if matches!(self.list.tab, Tab::Changed | Tab::All) {
             let name = |k: &Key| self.text_of(k).0;
             let build = if self.list.tab == Tab::All { ui::build_all } else { ui::build_changed };
-            let rows = build(&views, &self.engine.settings, &self.list, &self.catalog, &self.matcher(), &name);
+            let settings = shown.as_ref().unwrap_or(&self.engine.settings);
+            let rows = build(&views, settings, &self.list, &self.catalog, &self.matcher(), &name);
             return (views, rows, 0);
         }
         // The live order waits while a slider is held, so the row does not move under the pointer.
@@ -316,7 +367,7 @@ impl State {
             self.live_at = Some(now);
         }
         let (mut rows, mut fresh) =
-            ui::build(&views, &self.engine.settings, &self.list, &self.catalog, &self.matcher());
+            ui::build(&views, shown.as_ref().unwrap_or(&self.engine.settings), &self.list, &self.catalog, &self.matcher());
         // A group that collapsed because something in it keeps playing stays collapsed.
         let mut pinned = false;
         for row in &rows {
@@ -329,7 +380,8 @@ impl State {
             }
         }
         if pinned {
-            (rows, fresh) = ui::build(&views, &self.engine.settings, &self.list, &self.catalog, &self.matcher());
+            let settings = shown.as_ref().unwrap_or(&self.engine.settings);
+            (rows, fresh) = ui::build(&views, settings, &self.list, &self.catalog, &self.matcher());
         }
         (views, rows, fresh)
     }
@@ -402,8 +454,13 @@ impl State {
         let w = |key: &'static str| host.text_width(i18n::text(&code, key));
         let chips = self.list.chip_order().iter().map(|s| w(ui::category_key(*s).unwrap_or_default())).collect();
         let mut tabs = [0.0; 4];
+        let zone = self.zone_mode();
         for (i, t) in Tab::ORDER.iter().enumerate() {
-            tabs[i] = host.text_width(&tab_label(*t, &self.counts));
+            tabs[i] = match (zone, t) {
+                (true, Tab::Zones) => 0.0,
+                (true, Tab::Recent) => host.text_width(&format!("{} {}", tr("zones.here"), self.counts[0])),
+                _ => host.text_width(&tab_label(*t, &self.counts)),
+            };
         }
         let m = ui::Measure {
             chips,
@@ -411,8 +468,16 @@ impl State {
             sort_items: sort_keys(self.list.tab).iter().map(|k| w(k)).collect(),
             buttons: [w("changed.reset_all"), w("button.reset"), w("button.cancel")],
             profile: host.text_width(&self.profile_label(host)),
+            tab_lead: None,
+            zone_bar: false,
         };
         let banner = self.list.tab == Tab::Recent && self.list.frozen && fresh > 0;
+        let mut m = m;
+        if zone {
+            let first = ui::layout(self.gui[0], self.gui[1], banner, &m, &self.list);
+            m.tab_lead = Some(self.zone_head(host, &first).tabs_x);
+            m.zone_bar = true;
+        }
         ui::layout(self.gui[0], self.gui[1], banner, &m, &self.list)
     }
 
@@ -425,7 +490,7 @@ impl State {
     }
 
     fn set_volume(&mut self, key: &Key, value: u8, now: Instant) {
-        let s = &mut self.engine.settings;
+        let s = self.target();
         match key {
             Key::Sound(id) => s.stamps.insert(format!("sound {id}"), unix_now()),
             Key::Group(g) => s.stamps.insert(format!("group {g}"), unix_now()),
@@ -440,7 +505,7 @@ impl State {
     }
 
     fn reset(&mut self, key: &Key, now: Instant) {
-        let s = &mut self.engine.settings;
+        let s = self.target();
         match key {
             Key::Sound(id) => s.stamps.remove(&format!("sound {id}")),
             Key::Group(g) => s.stamps.remove(&format!("group {g}")),
@@ -457,7 +522,7 @@ impl State {
 
     /// Sets a sound's cooldown (0 removes it). It applies to the next start, so only the file changes.
     fn set_cooldown(&mut self, id: &str, secs: u32, now: Instant) {
-        let s = &mut self.engine.settings;
+        let s = self.target();
         if secs == 0 {
             s.cooldowns.remove(id);
             s.stamps.remove(&format!("cooldown {id}"));
@@ -509,6 +574,7 @@ impl State {
         };
         self.base = Some(base);
         self.path = self.profile_path(self.profiles.active);
+        self.load_zones();
     }
 
     fn profile_path(&self, id: u32) -> Option<PathBuf> {
@@ -576,6 +642,8 @@ impl State {
         let text = self.path.as_ref().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
         self.modified = self.path.as_ref().and_then(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok());
         self.engine.settings = Settings::parse(&text);
+        self.load_zones();
+        self.leave_zone();
         self.changed_external();
         self.list.before_mute.clear();
         self.list.drawer = None;
@@ -595,6 +663,274 @@ impl State {
                 self.save_index();
             }
         }
+    }
+
+    fn zones_path(&self, id: u32) -> Option<PathBuf> {
+        self.base.as_ref().map(|b| b.join(profiles::DIR).join(format!("{id}.zones.txt")))
+    }
+
+    fn load_zones(&mut self) {
+        let text = self.zones_path(self.profiles.active).and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+        self.engine.zones = zn::parse(&text);
+    }
+
+    /// Inside a zone's sound list (not its editor).
+    fn zone_mode(&self) -> bool {
+        self.zone_open.is_some() && self.editor.is_none()
+    }
+
+    fn open_zone_index(&self) -> Option<usize> {
+        let id = self.zone_open?;
+        self.engine.zones.iter().position(|z| z.id == id)
+    }
+
+    /// Indices of the zones of the world played now, in the profile's order.
+    fn world_zones(&self) -> Vec<usize> {
+        let Some(w) = &self.engine.world else { return Vec::new() };
+        self.engine.zones.iter().enumerate().filter(|(_, z)| &z.world == w).map(|(i, _)| i).collect()
+    }
+
+    /// The settings the list changes: the open zone's, else the profile's.
+    fn target(&mut self) -> &mut Settings {
+        match self.open_zone_index().filter(|_| self.editor.is_none()) {
+            Some(i) => &mut self.engine.zones[i].settings,
+            None => &mut self.engine.settings,
+        }
+    }
+
+    /// Inside a zone: its settings over the profile's, for showing.
+    fn shown_zone_settings(&self) -> Option<Settings> {
+        let i = self.open_zone_index().filter(|_| self.editor.is_none())?;
+        let mut s = self.engine.zones[i].settings.clone();
+        s.base = Some(Box::new(self.engine.settings.clone()));
+        Some(s)
+    }
+
+    fn reset_list_view(&mut self) {
+        self.list.before_mute.clear();
+        self.list.drawer = None;
+        self.list.scroll = 0.0;
+        self.list.confirm_reset = false;
+        self.list.sort_open = false;
+        self.anim.y.clear();
+        self.anim.reveal.clear();
+    }
+
+    fn leave_zone(&mut self) {
+        if self.zone_open.take().is_some() || self.editor.is_some() {
+            self.list.tab = Tab::Zones;
+        }
+        self.zone_confirm = false;
+        self.editor = None;
+        self.zone_drag = false;
+        self.reset_list_view();
+    }
+
+    fn open_zone(&mut self, id: u32) {
+        self.zone_open = Some(id);
+        self.zone_confirm = false;
+        self.editor = None;
+        self.list.tab = Tab::Recent;
+        self.reset_list_view();
+    }
+
+    fn new_zone(&mut self) {
+        let Some(p) = self.player_pos.filter(|_| self.engine.world.is_some()) else { return };
+        if self.engine.zones.len() >= zn::ZONES_MAX {
+            return;
+        }
+        let n = self.world_zones().len() + 1;
+        let (bx, by, bz) = (p[0].floor() as i32, p[1].floor() as i32, p[2].floor() as i32);
+        self.editor = Some(Editor {
+            id: None,
+            name: i18n::with_n(&lang::code(), "zones.new_name", n),
+            typing: false,
+            shape: Shape::Circle,
+            x: bx,
+            z: bz,
+            r: 8,
+            low: by - zn::HEIGHT_HALF,
+            high: by + zn::HEIGHT_HALF,
+            far: false,
+        });
+        self.list.search_focus = false;
+    }
+
+    fn edit_zone(&mut self) {
+        let Some(i) = self.open_zone_index() else { return };
+        let z = &self.engine.zones[i];
+        self.editor = Some(Editor {
+            id: Some(z.id),
+            name: z.name.clone(),
+            typing: false,
+            shape: z.shape,
+            x: z.x,
+            z: z.z,
+            r: z.r,
+            low: z.low,
+            high: z.high,
+            far: z.r > 28,
+        });
+        self.list.tab = Tab::Zones;
+        self.list.search_focus = false;
+    }
+
+    fn save_editor(&mut self, now: Instant) {
+        let Some(e) = self.editor.take() else { return };
+        let Some(world) = self.engine.world.clone() else { return };
+        let mut name = profiles::clean_name(&e.name);
+        if name.is_empty() {
+            name = i18n::with_n(&lang::code(), "zones.new_name", self.world_zones().len() + 1);
+        }
+        let id = match e.id.and_then(|id| self.engine.zones.iter().position(|z| z.id == id)) {
+            Some(i) => {
+                let z = &mut self.engine.zones[i];
+                (z.name, z.shape, z.x, z.z, z.r, z.low, z.high) = (name, e.shape, e.x, e.z, e.r, e.low, e.high);
+                z.id
+            }
+            None => {
+                let id = zn::next_id(&self.engine.zones);
+                let zone = Zone { id, world, name, shape: e.shape, x: e.x, z: e.z, r: e.r, low: e.low, high: e.high, settings: Settings::default() };
+                self.engine.zones.push(zone);
+                id
+            }
+        };
+        self.changed(now);
+        self.trace_line(now, &format!("\"event\":\"zone_saved\",\"id\":{id}"));
+        self.open_zone(id);
+    }
+
+    fn cancel_editor(&mut self) {
+        let reshaping = self.editor.take().is_some_and(|e| e.id.is_some());
+        self.zone_drag = false;
+        self.list.tab = if reshaping && self.zone_open.is_some() { Tab::Recent } else { Tab::Zones };
+    }
+
+    fn delete_open_zone(&mut self, now: Instant) {
+        if let Some(i) = self.open_zone_index() {
+            self.engine.zones.remove(i);
+            self.changed(now);
+        }
+        self.leave_zone();
+    }
+
+    fn zone_measure(&self, host: &dyn Host) -> zn::Measure {
+        let w = |key: &'static str| host.text_width(tr(key));
+        zn::Measure {
+            new_zone: w("zones.new"),
+            circle: w("zones.circle"),
+            square: w("zones.square"),
+            near: w("zones.near"),
+            far: w("zones.far"),
+            save: w("zones.save"),
+            cancel: w("button.cancel"),
+        }
+    }
+
+    /// The open zone's header in the tab row.
+    fn zone_head(&self, host: &dyn Host, lay: &ui::Layout) -> HeadLayout {
+        let name = self.open_zone_index().map(|i| self.engine.zones[i].name.clone()).unwrap_or_default();
+        let w = |key: &'static str| host.text_width(tr(key));
+        zn::head_layout(
+            lay.tabs,
+            w("zones.back"),
+            host.text_width(&name) + 12.0,
+            [w("zones.edit"), w("zones.delete"), w("zones.delete_yes"), w("button.cancel")],
+            self.zone_confirm,
+        )
+    }
+
+    /// A click on the Zones tab's list or editor.
+    fn zones_click(&mut self, host: &dyn Host, lay: &ui::Layout, mouse: [f32; 2], now: Instant) {
+        let area = zones_area(lay);
+        let m = self.zone_measure(host);
+        if self.editor.is_some() {
+            let el = zn::editor_layout(area, &m);
+            let hit = zn::editor_hit(&el, mouse);
+            match hit {
+                EditorHit::Save => return self.save_editor(now),
+                EditorHit::Cancel => return self.cancel_editor(),
+                _ => {}
+            }
+            if hit == EditorHit::Slider {
+                self.zone_drag = true;
+            }
+            let Some(e) = self.editor.as_mut() else { return };
+            e.typing = hit == EditorHit::Name;
+            match hit {
+                EditorHit::Circle => e.shape = Shape::Circle,
+                EditorHit::Square => e.shape = Shape::Square,
+                EditorHit::Near => e.far = false,
+                EditorHit::Far => e.far = true,
+                EditorHit::Slider => e.r = zn::slider_radius(el.slider, mouse[0]),
+                _ => {}
+            }
+            return;
+        }
+        let wz = self.world_zones();
+        let ll = zn::list_layout(area, &m, wz.len(), self.zscroll);
+        if ui::contains(ll.new_zone, mouse) {
+            self.new_zone();
+            return;
+        }
+        if let Some((k, _)) = ll.cards.iter().find(|(_, r)| ui::contains(*r, mouse)) {
+            let id = self.engine.zones[wz[*k]].id;
+            self.open_zone(id);
+        }
+    }
+
+    /// Reads the terrain around the editor's zone and paints the map image when either changed.
+    fn ensure_map(&mut self, host: &dyn Host) {
+        let Some(e) = self.editor.clone() else { return };
+        let world = self.engine.world.clone().unwrap_or_default();
+        let span = e.span();
+        let origin = [e.x - span / 2, e.z - span / 2];
+        let tkey = (world.clone(), origin, span);
+        if self.map.terrain_key.as_ref() != Some(&tkey) {
+            self.map.terrain = read_terrain(host, origin, span);
+            self.map.terrain_key = Some(tkey);
+            self.map.image_key = None;
+        }
+        let others: Vec<(&Zone, u32)> = self
+            .engine
+            .zones
+            .iter()
+            .enumerate()
+            .filter(|(_, z)| z.world == world && Some(z.id) != e.id)
+            .map(|(i, z)| (z, zn::color(i)))
+            .collect();
+        let other_key: Vec<String> = others.iter().map(|(z, c)| format!("{}:{:?}:{}:{}:{}:{c}", z.id, z.shape, z.x, z.z, z.r)).collect();
+        let ikey = format!("{origin:?}|{span}|{:?}|{}|{}|{}|{}", e.shape, e.x, e.z, e.r, other_key.join(","));
+        if self.map.image_key.as_ref() == Some(&ikey) {
+            return;
+        }
+        let n = span as usize;
+        let cell = MAP_PX / n;
+        let mut img = vec![0u8; MAP_PX * MAP_PX * 4];
+        for dz in 0..n {
+            for dx in 0..n {
+                let (bx, bz) = (origin[0] + dx as i32, origin[1] + dz as i32);
+                let mut c = self.map.terrain.get(dz * n + dx).copied().unwrap_or(0x20_20_24);
+                if let Some((_, col)) = others.iter().find(|(z, _)| z.holds_column(bx, bz)) {
+                    c = mix_rgb(c, *col, 0.33);
+                }
+                let inside = zn::inside(e.shape, e.r, bx - e.x, bz - e.z);
+                let fill = if inside { mix_rgb(c, OWN, 0.42) } else { c };
+                // Every block of the zone is outlined, so the player can count them.
+                let edge = if inside && cell >= 5 { mix_rgb(c, OWN, 0.75) } else { fill };
+                for py in 0..cell {
+                    for px in 0..cell {
+                        let border = px == 0 || py == 0 || px == cell - 1 || py == cell - 1;
+                        let col = if border { edge } else { fill };
+                        let o = ((dz * cell + py) * MAP_PX + dx * cell + px) * 4;
+                        img[o..o + 4].copy_from_slice(&[(col >> 16) as u8, (col >> 8) as u8, col as u8, 0xFF]);
+                    }
+                }
+            }
+        }
+        self.map.image = img;
+        self.map.image_key = Some(ikey);
+        self.map.upload = true;
     }
 
     fn page_layout(&self, host: &dyn Host, lay: &ui::Layout) -> PageLayout {
@@ -664,6 +1000,11 @@ impl State {
                 {
                     let _ = std::fs::copy(from, to);
                 }
+                if let (Some(from), Some(to)) = (self.zones_path(src_id), self.zones_path(id))
+                    && from.exists()
+                {
+                    let _ = std::fs::copy(from, to);
+                }
                 self.profile_counts.insert(id, count);
                 self.save_index();
                 self.page.sel = i;
@@ -672,6 +1013,9 @@ impl State {
             PageHit::DeleteYes => {
                 if let Some(id) = self.profiles.delete(self.page.sel) {
                     if let Some(f) = self.profile_path(id) {
+                        let _ = std::fs::remove_file(f);
+                    }
+                    if let Some(f) = self.zones_path(id) {
                         let _ = std::fs::remove_file(f);
                     }
                     self.profile_counts.remove(&id);
@@ -723,16 +1067,39 @@ impl State {
         if std::fs::write(&path, self.engine.settings.to_text()).is_ok() {
             self.modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         }
+        if let Some(zp) = self.zones_path(self.profiles.active)
+            && (!self.engine.zones.is_empty() || zp.exists())
+        {
+            let _ = std::fs::write(zp, zn::to_text(&self.engine.zones));
+        }
     }
 
+    /// Sends the icon sheet, with the editor's map under it when there is one, to the game's image slot.
     fn upload_icons(&mut self, host: &mut dyn Host) {
         if !self.icons_decoded {
             self.icons_decoded = true;
             self.icons = decode_icons();
         }
-        if let Some((w, h, rgba)) = &self.icons {
-            self.icons_live = host.mod_image(*w, *h, rgba);
+        let Some((w, h, rgba)) = &self.icons else { return };
+        let (w, h) = (*w as usize, *h as usize);
+        if self.map.image.is_empty() {
+            self.icons_live = host.mod_image(w as u32, h as u32, rgba);
+            return;
         }
+        let cw = w.max(MAP_PX);
+        let ch = h + MAP_PX;
+        let mut img = vec![0u8; cw * ch * 4];
+        for y in 0..h {
+            img[y * cw * 4..y * cw * 4 + w * 4].copy_from_slice(&rgba[y * w * 4..(y + 1) * w * 4]);
+        }
+        for y in 0..MAP_PX {
+            let o = (y + h) * cw * 4;
+            img[o..o + MAP_PX * 4].copy_from_slice(&self.map.image[y * MAP_PX * 4..(y + 1) * MAP_PX * 4]);
+        }
+        self.icons_live = host.mod_image(cw as u32, ch as u32, &img);
+        self.map.top = h as f32;
+        self.map.upload = false;
+        self.map.uploaded_key = self.map.image_key.clone();
     }
 
     fn trace_line(&mut self, now: Instant, body: &str) {
@@ -799,6 +1166,14 @@ impl Hooks for Hushlist {
                     }
                 }
                 st.profile_counts.clear();
+                for id in st.profiles.list.iter().map(|p| p.id).filter(|id| *id != st.profiles.active).collect::<Vec<_>>() {
+                    if let Some(f) = st.zones_path(id).filter(|f| f.exists()) {
+                        let mut zones = zn::parse(&std::fs::read_to_string(&f).unwrap_or_default());
+                        zones.iter_mut().for_each(|z| z.settings = Settings::default());
+                        let _ = std::fs::write(f, zn::to_text(&zones));
+                    }
+                }
+                st.engine.zones.iter_mut().for_each(|z| z.settings = Settings::default());
                 st.engine.settings = Settings::default();
                 st.list.before_mute.clear();
                 st.changed(now);
@@ -834,6 +1209,20 @@ impl Hooks for Hushlist {
             st.load(&*host, now);
         } else if st.next_reload.is_none_or(|t| now >= t) {
             st.reload(now);
+        }
+        st.player_pos = host.player().map(|p| [p.x, p.y, p.z]);
+        let world = host.client_state().and_then(|c| c.world).map(|w| match w {
+            NativeWorldId::Singleplayer(save) => format!("sp:{save}"),
+            NativeWorldId::Server(address) => format!("server:{address}"),
+            _ => "other".to_owned(),
+        });
+        if world != st.engine.world {
+            st.engine.world = world;
+            st.leave_zone();
+            st.changed_external();
+        }
+        if st.map.upload && host.mod_screen() == Some(MOD_ID) {
+            st.upload_icons(host);
         }
         if host.mod_screen() == Some(MOD_ID) {
             if !st.icons_live {
@@ -881,9 +1270,9 @@ impl Hooks for Hushlist {
         // While the mod re-applies volumes, the game replays every playing sound through
         // this hook; those calls must not mark short sounds as still playing.
         let d = if !s.starting && !matches!(st.refresh, Refresh::Idle) {
-            crate::core::Decision { factor: st.engine.settings.volume_factor(s.identifier), cancel: false }
+            crate::core::Decision { factor: st.engine.factor(s.identifier, s.position, s.relative), cancel: false }
         } else {
-            st.engine.decide(s.identifier, s.source, s.position, s.starting, now)
+            st.engine.decide(s.identifier, s.source, s.position, s.relative, s.starting, now)
         };
         if s.starting {
             let body = format!(
@@ -943,6 +1332,42 @@ impl Hooks for Hushlist {
             }
             return Flow::Cancel;
         }
+        let mouse = event.screen.mouse;
+        if st.zone_mode() {
+            let head = st.zone_head(host, &lay);
+            let on = |r: Option<Rect>| r.is_some_and(|r| ui::contains(r, mouse));
+            if ui::contains(head.back, mouse) {
+                st.leave_zone();
+                return Flow::Cancel;
+            }
+            if on(head.edit) {
+                st.edit_zone();
+                return Flow::Cancel;
+            }
+            if on(head.delete) {
+                st.zone_confirm = true;
+                return Flow::Cancel;
+            }
+            if on(head.yes) {
+                st.delete_open_zone(now);
+                return Flow::Cancel;
+            }
+            if on(head.no) {
+                st.zone_confirm = false;
+                return Flow::Cancel;
+            }
+        }
+        if st.list.tab == Tab::Zones && !st.zone_mode() {
+            // The header and the tabs work as everywhere; the rest is the zone list or the editor.
+            match ui::hit(&lay, &[], 0.0, mouse) {
+                Hit::Close | Hit::Profile | Hit::Tab(_) | Hit::Search | Hit::SearchClear => {}
+                _ => {
+                    st.list.search_focus = false;
+                    st.zones_click(host, &lay, mouse, now);
+                    return Flow::Cancel;
+                }
+            }
+        }
         let hit = ui::hit(&lay, &rows, st.list.scroll, event.screen.mouse);
         // A click anywhere else gives the keyboard back to the game's keys.
         st.list.search_focus = matches!(hit, Hit::Search | Hit::SearchClear);
@@ -957,7 +1382,14 @@ impl Hooks for Hushlist {
             Hit::Profile => st.open_page(),
             Hit::Tab(i) => {
                 let tab = Tab::ORDER[i];
-                if tab.ready() && tab != st.list.tab {
+                if st.editor.is_some() {
+                    st.editor = None;
+                    st.zone_open = None;
+                    st.zone_drag = false;
+                }
+                if tab == Tab::Zones && st.zone_open.is_some() {
+                    st.leave_zone();
+                } else if tab.ready() && tab != st.list.tab {
                     st.list.tab = tab;
                     st.filter_changed(now);
                     st.anim.y.clear();
@@ -977,7 +1409,7 @@ impl Hooks for Hushlist {
             Hit::ConfirmNo => st.list.confirm_reset = false,
             Hit::ConfirmYes => {
                 st.list.confirm_reset = false;
-                st.engine.settings = Settings::default();
+                *st.target() = Settings::default();
                 st.list.before_mute.clear();
                 st.changed(now);
             }
@@ -1058,7 +1490,9 @@ impl Hooks for Hushlist {
         if host.mod_screen() != Some(MOD_ID) {
             return Flow::Continue;
         }
-        self.lock().drag = None;
+        let mut st = self.lock();
+        st.drag = None;
+        st.zone_drag = false;
         Flow::Cancel
     }
 
@@ -1068,6 +1502,15 @@ impl Hooks for Hushlist {
         }
         let now = Instant::now();
         let mut st = self.lock();
+        if st.zone_drag {
+            let fresh = 0;
+            let lay = st.layout(host, fresh);
+            let el = zn::editor_layout(zones_area(&lay), &st.zone_measure(host));
+            if let Some(e) = st.editor.as_mut() {
+                e.r = zn::slider_radius(el.slider, event.screen.mouse[0]);
+            }
+            return Flow::Cancel;
+        }
         let Some(key) = st.drag.clone() else { return Flow::Cancel };
         let (_, rows, fresh) = st.rows(now);
         let lay = st.layout(host, fresh);
@@ -1095,6 +1538,34 @@ impl Hooks for Hushlist {
         }
         let mut st = self.lock();
         let ctrl = event.modifiers & 2 != 0;
+        if let Some(e) = st.editor.as_mut() {
+            if e.typing {
+                match event.key {
+                    "key.keyboard.backspace" => {
+                        if ctrl {
+                            e.name.clear();
+                        } else {
+                            e.name.pop();
+                        }
+                    }
+                    "key.keyboard.enter" | "key.keyboard.keypad.enter" | "key.keyboard.escape" => e.typing = false,
+                    _ => {}
+                }
+                return Flow::Cancel;
+            }
+            if event.key == "key.keyboard.escape" {
+                st.cancel_editor();
+                return Flow::Cancel;
+            }
+        }
+        if st.zone_mode() && !st.list.search_focus && event.key == "key.keyboard.escape" {
+            if st.zone_confirm {
+                st.zone_confirm = false;
+            } else {
+                st.leave_zone();
+            }
+            return Flow::Cancel;
+        }
         if st.page.open {
             if st.page.edit.is_none() {
                 // Escape goes back to the list instead of closing the screen.
@@ -1149,6 +1620,12 @@ impl Hooks for Hushlist {
             return Flow::Continue;
         }
         let mut st = self.lock();
+        if let Some(e) = st.editor.as_mut().filter(|e| e.typing) {
+            if !event.c.is_control() && e.name.chars().count() < profiles::NAME_MAX {
+                e.name.push(event.c);
+            }
+            return Flow::Cancel;
+        }
         if st.page.open {
             if st.page.edit.is_none() {
                 return Flow::Continue;
@@ -1173,6 +1650,10 @@ impl Hooks for Hushlist {
             return Flow::Continue;
         }
         let mut st = self.lock();
+        if st.list.tab == Tab::Zones && !st.zone_mode() {
+            st.zscroll = (st.zscroll - event.scroll[1] as f32 * 18.0).max(0.0);
+            return Flow::Cancel;
+        }
         st.list.scroll = (st.list.scroll - event.scroll[1] as f32 * 18.0).max(0.0);
         Flow::Cancel
     }
@@ -1284,8 +1765,16 @@ fn dump_rows(st: &mut State, rows: &[Row], lay: &ui::Layout, now: Instant) {
     let r = |r: Rect| format!("[{},{},{},{}]", r[0], r[1], r[2], r[3]);
     let chips: Vec<String> = lay.chips.iter().map(|c| r(*c)).collect();
     let chip_ids: Vec<String> = st.list.chip_order().iter().map(|s| s.to_string()).collect();
+    let head = st.head.clone().filter(|_| st.zone_mode());
+    let head = head.as_ref();
     let layout = format!(
-        "{{\"page\":\"list\",\"profile\":{},\"search\":{},\"search_clear\":{},\"close\":{},\"chips\":[{}],\"chip_sources\":[{}],\"view_flat\":{},\"view_group\":{},\"banner\":{},\"list\":{},\"freeze\":{},\"query\":{:?},\"focus\":{},\"flat\":{},\"tab\":\"{:?}\",\"tabs\":[{}],\"sort\":{},\"sort_menu\":[{}],\"reset_all\":{},\"confirm_yes\":{},\"confirm_no\":{}}}",
+        "{{\"page\":\"list\",\"zone\":{},\"z_back\":{},\"z_edit\":{},\"z_delete\":{},\"z_yes\":{},\"z_no\":{},\"profile\":{},\"search\":{},\"search_clear\":{},\"close\":{},\"chips\":[{}],\"chip_sources\":[{}],\"view_flat\":{},\"view_group\":{},\"banner\":{},\"list\":{},\"freeze\":{},\"query\":{:?},\"focus\":{},\"flat\":{},\"tab\":\"{:?}\",\"tabs\":[{}],\"sort\":{},\"sort_menu\":[{}],\"reset_all\":{},\"confirm_yes\":{},\"confirm_no\":{}}}",
+        st.zone_open.filter(|_| st.zone_mode()).map_or("null".to_owned(), |z| z.to_string()),
+        head.map_or("null".to_owned(), |h| r(h.back)),
+        head.and_then(|h| h.edit).map_or("null".to_owned(), r),
+        head.and_then(|h| h.delete).map_or("null".to_owned(), r),
+        head.and_then(|h| h.yes).map_or("null".to_owned(), r),
+        head.and_then(|h| h.no).map_or("null".to_owned(), r),
         r(lay.profile), r(lay.search), r(lay.search_clear), r(lay.close), chips.join(","), chip_ids.join(","), r(lay.view_flat),
         r(lay.view_group), lay.banner.map_or("null".to_owned(), r), r(lay.list), r(lay.freeze), st.list.query,
         st.list.search_focus, st.list.flat, st.list.tab,
@@ -1296,7 +1785,10 @@ fn dump_rows(st: &mut State, rows: &[Row], lay: &ui::Layout, now: Instant) {
         lay.confirm_yes.map_or("null".to_owned(), r),
         lay.confirm_no.map_or("null".to_owned(), r)
     );
-    let _ = std::fs::write(path, format!("{{\"layout\":{layout},\"rows\":[{}]}}", items.join(",")));
+    let _ = std::fs::write(
+        path,
+        format!("{{\"layout\":{layout},\"n_rows\":{},\"scroll\":{},\"rows\":[{}]}}", rows.len(), st.list.scroll, items.join(",")),
+    );
 }
 
 /// Sort menu items of a tab.
@@ -1321,17 +1813,17 @@ fn tab_key(tab: Tab) -> &'static str {
     }
 }
 
-fn tab_count(tab: Tab, counts: &[usize; 3]) -> Option<usize> {
+fn tab_count(tab: Tab, counts: &[usize; 4]) -> Option<usize> {
     match tab {
         Tab::Recent => Some(counts[0]),
         Tab::All => Some(counts[1]),
         Tab::Changed => Some(counts[2]),
-        Tab::Zones => None,
+        Tab::Zones => Some(counts[3]),
     }
 }
 
 /// A tab's label with its count, as measured for the layout.
-fn tab_label(tab: Tab, counts: &[usize; 3]) -> String {
+fn tab_label(tab: Tab, counts: &[usize; 4]) -> String {
     let label = tr(tab_key(tab));
     match tab_count(tab, counts) {
         Some(n) => format!("{label} {n}"),
@@ -1542,6 +2034,304 @@ fn dump_page(st: &mut State, lay: &ui::Layout, pl: &PageLayout, now: Instant) {
     let _ = std::fs::write(path, format!("{{\"layout\":{layout},\"rows\":[]}}"));
 }
 
+/// Where the Zones tab's list or editor goes: under the tabs, inside the panel's margin.
+fn zones_area(lay: &ui::Layout) -> Rect {
+    let p = lay.panel;
+    let top = lay.tabs[1] + lay.tabs[3] + 8.0;
+    [p[0] + 8.0, top, p[2] - 16.0, (p[1] + p[3] - 8.0 - top).max(0.0)]
+}
+
+fn mix_rgb(a: u32, b: u32, t: f32) -> u32 {
+    let ch = |s: u32| -> u32 {
+        let x = ((a >> s) & 0xFF) as f32;
+        let y = ((b >> s) & 0xFF) as f32;
+        ((x + (y - x) * t).round() as u32).min(255) << s
+    };
+    ch(16) | ch(8) | ch(0)
+}
+
+/// Map colours of the blocks seen from above, shaded like the game's maps: a block higher than its
+/// northern neighbour is lighter, a lower one darker. Columns not loaded stay dark.
+fn read_terrain(host: &dyn Host, origin: [i32; 2], span: i32) -> Vec<u32> {
+    let n = span as usize;
+    let mut colors = vec![0x20_20_24u32; n * n];
+    let from = [origin[0].div_euclid(16), origin[1].div_euclid(16)];
+    let to = [(origin[0] + span - 1).div_euclid(16), (origin[1] + span - 1).div_euclid(16)];
+    let Ok(snap) = host.client_chunks(from, to) else { return colors };
+    let low = snap.height().start;
+    let mut heights = vec![i32::MIN; n * n];
+    let mut water = vec![false; n * n];
+    for dz in 0..n {
+        for dx in 0..n {
+            let (bx, bz) = (origin[0] + dx as i32, origin[1] + dz as i32);
+            if !snap.loaded([bx, bz]) {
+                continue;
+            }
+            let mut y = snap.section_top([bx, bz]) - 1;
+            while y >= low {
+                if let Some((id, col)) = host.block_map_color(snap.block([bx, y, bz]))
+                    && id != 0
+                {
+                    let i = dz * n + dx;
+                    colors[i] = col;
+                    heights[i] = y;
+                    // MapColor.WATER: flat, as the game's maps show water without relief.
+                    water[i] = id == 12;
+                    break;
+                }
+                y -= 1;
+            }
+        }
+    }
+    let shaded: Vec<u32> = (0..n * n)
+        .map(|i| {
+            let h = heights[i];
+            if h == i32::MIN {
+                return colors[i];
+            }
+            let north = if i >= n { heights[i - n] } else { h };
+            let f = if water[i] || north == i32::MIN || north == h {
+                220
+            } else if h > north {
+                255
+            } else {
+                180
+            };
+            mix_rgb(0, colors[i], f as f32 / 255.0)
+        })
+        .collect();
+    shaded
+}
+
+/// Inside a zone: back, the zone's name, the sub-tabs, "Edit shape" and "Delete...", and the line
+/// that says the settings apply to this zone only (or the delete question).
+fn draw_zone_head(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layout, mouse: [f32; 2]) {
+    let head = st.zone_head(host, lay);
+    let Some(i) = st.open_zone_index() else { return };
+    let zone = st.engine.zones[i].clone();
+    button(host, b, head.back, tr("zones.back"), TEXT, EDGE, ui::contains(head.back, mouse));
+    let col = zn::color(i);
+    rrect(host, b, [head.name_at[0], head.name_at[1] + 1.0, 6.0, 6.0], 1.0, argb(col));
+    host.text(b, &fit(host, &zone.name, head.name_room), [head.name_at[0] + 10.0, head.name_at[1]], TEXT, false);
+    let t = lay.tabs;
+    for (k, tab) in Tab::ORDER.iter().take(3).enumerate() {
+        let r = lay.tab_rects[k];
+        let x = r[0] + 3.0;
+        let label = if *tab == Tab::Recent { tr("zones.here") } else { tr(tab_key(*tab)) };
+        let active = *tab == st.list.tab;
+        let rgb = if active || ui::contains(r, mouse) { TEXT } else { DIM };
+        host.text(b, label, [x, t[1] + 3.0], rgb, false);
+        if let Some(n) = tab_count(*tab, &st.counts) {
+            host.text(b, &n.to_string(), [x + host.text_width(label) + host.text_width(" "), t[1] + 3.0], FAINT, false);
+        }
+        if active {
+            rrect(host, b, [x - 1.0, t[1] + t[3] - 2.0, r[2] - 4.0, 2.0], 1.0, argb(TEXT));
+        }
+    }
+    let small = |host: &dyn Host, b: &mut HudBatch, r: Option<Rect>, key: &'static str, danger: bool| {
+        let Some(r) = r else { return };
+        let (rgb, edge) = if danger { (DANGER, 0x80_FF_8A_7A) } else { (TEXT, EDGE) };
+        let hover = ui::contains(r, mouse);
+        rrect(host, b, r, 3.0, if hover { mix(edge, 0xFF_FF_FF_FF, 0.25) } else { edge });
+        rrect(host, b, [r[0] + 1.0, r[1] + 1.0, r[2] - 2.0, r[3] - 2.0], 2.0, argb(if hover { 0x24_22_2C } else { 0x16_15_1B }));
+        host.text(b, tr(key), [r[0] + (r[2] - host.text_width(tr(key))) / 2.0, r[1] + 4.0], rgb, false);
+    };
+    small(host, b, head.edit, "zones.edit", false);
+    small(host, b, head.delete, "zones.delete", true);
+    small(host, b, head.yes, "zones.delete_yes", true);
+    small(host, b, head.no, "button.cancel", false);
+    if let Some(bar) = lay.zone_bar {
+        let (text, rgb) = if st.zone_confirm {
+            (tr("zones.delete_q").replace("{name}", &zone.name), DANGER)
+        } else {
+            (tr("zones.bar").replace("{name}", &zone.name), DIM)
+        };
+        host.text(b, &fit(host, &text, bar[2] - 4.0), [bar[0] + 2.0, bar[1] + 2.0], rgb, false);
+    }
+    st.head = Some(head);
+}
+
+/// A zone's one-line description: shape and size, area, height.
+fn zone_meta(code: &str, shape: Shape, r: i32, low: i32, high: i32) -> String {
+    let shape_text = match shape {
+        Shape::Circle => i18n::with_n(code, "zones.meta_circle", r),
+        Shape::Square => i18n::with_n(code, "zones.meta_square", 2 * r + 1),
+    };
+    let area = i18n::with_n(code, "zones.meta_area", zn::area(shape, r));
+    let height = i18n::text(code, "zones.meta_height").replace("{list}", &format!("{low}–{high}"));
+    format!("{shape_text} · {area} · {height}")
+}
+
+/// The Zones tab: the zones of this world, or the editor.
+fn draw_zones(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layout, mouse: [f32; 2], now_ms: u128) {
+    let code = lang::code();
+    let area = zones_area(lay);
+    let m = st.zone_measure(host);
+    if st.editor.is_some() {
+        st.ensure_map(host);
+        let Some(e) = st.editor.clone() else { return };
+        let el = zn::editor_layout(area, &m);
+        let map = el.map;
+        rrect(host, b, [map[0] - 1.0, map[1] - 1.0, map[2] + 2.0, map[3] + 2.0], 2.0, EDGE);
+        let ready = st.map.uploaded_key.is_some() && st.map.uploaded_key == st.map.image_key && st.icons_live;
+        if ready {
+            host.sprite(b, MOD_IMAGE, [0.0, st.map.top, MAP_PX as f32, MAP_PX as f32], map);
+        } else {
+            host.fill(b, map, argb(0x20_20_24));
+        }
+        // The player: an amber square where they stand.
+        if let Some(p) = st.player_pos {
+            let span = e.span() as f64;
+            let ox = f64::from(e.x - e.span() / 2);
+            let oz = f64::from(e.z - e.span() / 2);
+            let mx = map[0] + ((p[0] - ox) / span) as f32 * map[2];
+            let my = map[1] + ((p[2] - oz) / span) as f32 * map[3];
+            if ui::contains(map, [mx, my]) {
+                host.fill(b, [mx - 3.0, my - 3.0, 6.0, 6.0], argb(0x17_15_1E));
+                host.fill(b, [mx - 2.0, my - 2.0, 4.0, 4.0], argb(AMBER));
+            }
+        }
+        let title = tr(if e.id.is_some() { "zones.title_edit" } else { "zones.title_new" });
+        host.text(b, title, el.title_at, TEXT, false);
+        host.text(b, tr("zones.name"), el.name_label_at, DIM, false);
+        let f = el.name;
+        rrect(host, b, f, 3.0, if e.typing { FIELD_EDGE_FOCUS } else if ui::contains(f, mouse) { 0x38_FF_FF_FF } else { EDGE });
+        rrect(host, b, [f[0] + 1.0, f[1] + 1.0, f[2] - 2.0, f[3] - 2.0], 2.0, FIELD);
+        let mut shown: &str = &e.name;
+        while host.text_width(shown) > f[2] - 10.0 {
+            let mut chars = shown.chars();
+            chars.next();
+            shown = chars.as_str();
+        }
+        host.text(b, shown, [f[0] + 5.0, f[1] + 4.0], TEXT, false);
+        if e.typing && (now_ms / 530) % 2 == 0 {
+            host.fill(b, [f[0] + 6.0 + host.text_width(shown), f[1] + 4.0, 1.0, 8.0], argb(TEXT));
+        }
+        let seg = |host: &dyn Host, b: &mut HudBatch, a: Rect, c: Rect, la: &str, lc: &str, first: bool| {
+            let whole = [a[0], a[1], c[0] + c[2] - a[0], a[3]];
+            rrect(host, b, whole, 3.0, EDGE);
+            rrect(host, b, [whole[0] + 1.0, whole[1] + 1.0, whole[2] - 2.0, whole[3] - 2.0], 2.0, argb(0x16_15_1B));
+            let on = if first { a } else { c };
+            rrect(host, b, [on[0] + 1.0, on[1] + 1.0, on[2] - 2.0, on[3] - 2.0], 2.0, 0x30_FF_FF_FF);
+            for (r, l, active) in [(a, la, first), (c, lc, !first)] {
+                let rgb = if active || ui::contains(r, mouse) { TEXT } else { DIM };
+                host.text(b, l, [r[0] + (r[2] - host.text_width(l)) / 2.0, r[1] + 4.0], rgb, false);
+            }
+        };
+        seg(host, b, el.circle, el.square, tr("zones.circle"), tr("zones.square"), e.shape == Shape::Circle);
+        host.text(b, tr("zones.scale"), el.zoom_label_at, DIM, false);
+        seg(host, b, el.near, el.far, tr("zones.near"), tr("zones.far"), !e.far);
+        let size = match e.shape {
+            Shape::Circle => i18n::with_n(&code, "zones.radius", e.r),
+            Shape::Square => tr("zones.side").replace("{list}", &format!("{0}×{0}", 2 * e.r + 1)),
+        };
+        host.text(b, &size, el.radius_label_at, TEXT, false);
+        let s = el.slider;
+        let cy = (s[1] + s[3] / 2.0).floor();
+        rrect(host, b, [s[0] + 2.0, cy - 1.5, s[2] - 4.0, 3.0], 1.5, TRACK);
+        let tx = zn::slider_pos(s, e.r);
+        rrect(host, b, [s[0] + 2.0, cy - 1.5, tx - s[0] - 2.0, 3.0], 1.5, argb(OWN));
+        let grow = if st.zone_drag || ui::contains(s, mouse) { 1.0 } else { 0.0 };
+        rrect(host, b, [tx - 2.5 - grow * 0.5, cy - 5.0 - grow, 5.0 + grow, 10.0 + grow * 2.0], 2.5, THUMB);
+        let height = tr("zones.height").replace("{list}", &format!("{}–{}", e.low, e.high));
+        host.text(b, &fit(host, &height, area[0] + area[2] - el.form_x), el.height_at, DIM, false);
+        host.text(b, &i18n::with_n(&code, "zones.area", e.area()), el.area_at, DIM, false);
+        button(host, b, el.save, tr("zones.save"), OWN, 0xC0_6F_F0_DA, ui::contains(el.save, mouse));
+        button(host, b, el.cancel, tr("button.cancel"), TEXT, EDGE, ui::contains(el.cancel, mouse));
+        dump_zones(st, None, Some(&el), now_ms);
+        return;
+    }
+
+    let wz = st.world_zones();
+    let ll = zn::list_layout(area, &m, wz.len(), st.zscroll);
+    st.zscroll = st.zscroll.min(zn::list_max_scroll(wz.len(), ll.area));
+    host.text(b, &i18n::with_n(&code, "zones.count", st.engine.zones.len()), ll.count_at, FAINT, false);
+    let full = st.engine.zones.len() >= zn::ZONES_MAX;
+    button(host, b, ll.new_zone, tr("zones.new"), if full { FAINT } else { TEXT }, EDGE, !full && ui::contains(ll.new_zone, mouse));
+    if wz.is_empty() {
+        let l = ll.area;
+        let a = tr("zones.none");
+        host.text(b, a, [l[0] + (l[2] - host.text_width(a)) / 2.0, l[1] + 40.0], TEXT, false);
+        let hint = tr("zones.none_hint");
+        // The hint in up to two lines.
+        let room = l[2] - 40.0;
+        let mut first = String::new();
+        let mut words = hint.split(' ').peekable();
+        while let Some(word) = words.peek() {
+            let next = if first.is_empty() { (*word).to_owned() } else { format!("{first} {word}") };
+            if host.text_width(&next) > room && !first.is_empty() {
+                break;
+            }
+            first = next;
+            words.next();
+        }
+        let rest = fit(host, &words.collect::<Vec<_>>().join(" "), room);
+        for (k, line) in [first, rest].iter().enumerate() {
+            host.text(b, line, [l[0] + (l[2] - host.text_width(line)) / 2.0, l[1] + 56.0 + k as f32 * 11.0], DIM, false);
+        }
+    }
+    for (k, r) in &ll.cards {
+        let i = wz[*k];
+        let z = st.engine.zones[i].clone();
+        let hover = ui::contains(*r, mouse);
+        rrect(host, b, *r, 4.0, if hover { ROW_HOVER } else { ROW });
+        rrect(host, b, [r[0] + 8.0, r[1] + 9.0, 12.0, 12.0], 2.0, argb(zn::color(i)));
+        let inside = st.player_pos.is_some_and(|p| z.holds(p));
+        let status = match st.player_pos {
+            Some(_) if inside => tr("zones.inside").to_owned(),
+            Some(p) => i18n::with_n(&code, "zones.away", z.distance(p)),
+            None => String::new(),
+        };
+        let changed = i18n::with_n(&code, "zones.changed", z.settings.count());
+        let right = r[0] + r[2] - 10.0;
+        let sw = host.text_width(&status);
+        host.text(b, &status, [right - sw, r[1] + 6.0], if inside { OWN } else { DIM }, false);
+        host.text(b, &changed, [right - host.text_width(&changed), r[1] + 18.0], FAINT, false);
+        let room = right - sw.max(host.text_width(&changed)) - 12.0 - (r[0] + 28.0);
+        host.text(b, &fit(host, &z.name, room), [r[0] + 28.0, r[1] + 6.0], TEXT, false);
+        host.text(b, &fit(host, &zone_meta(&code, z.shape, z.r, z.low, z.high), room), [r[0] + 28.0, r[1] + 18.0], FAINT, false);
+    }
+    dump_zones(st, Some(&ll), None, now_ms);
+}
+
+/// The Zones tab as drawn, for test scripts (`HUSHLIST_TRACE`).
+fn dump_zones(st: &mut State, list: Option<&zn::ListLayout>, editor: Option<&zn::EditorLayout>, _now_ms: u128) {
+    let Some(trace) = std::env::var_os("HUSHLIST_TRACE") else { return };
+    let now = Instant::now();
+    if st.rows_dumped.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(250)) {
+        return;
+    }
+    st.rows_dumped = Some(now);
+    let r = |r: Rect| format!("[{},{},{},{}]", r[0], r[1], r[2], r[3]);
+    let wz = st.world_zones();
+    let zones: Vec<String> = wz
+        .iter()
+        .map(|i| {
+            let z = &st.engine.zones[*i];
+            format!("{{\"id\":{},\"name\":{:?},\"r\":{},\"count\":{}}}", z.id, z.name, z.r, z.settings.count())
+        })
+        .collect();
+    let mut layout = format!(
+        "\"page\":\"zones\",\"world\":{:?},\"zones\":[{}],\"tab_rects\":[]",
+        st.engine.world.clone().unwrap_or_default(),
+        zones.join(",")
+    );
+    if let Some(ll) = list {
+        let cards: Vec<String> = ll.cards.iter().map(|(_, c)| r(*c)).collect();
+        layout.push_str(&format!(",\"new_zone\":{},\"cards\":[{}]", r(ll.new_zone), cards.join(",")));
+    }
+    if let (Some(el), Some(e)) = (editor, st.editor.as_ref()) {
+        let ready = st.map.uploaded_key.is_some() && st.map.uploaded_key == st.map.image_key;
+        layout.push_str(&format!(
+            ",\"editor\":true,\"e_name\":{:?},\"e_typing\":{},\"e_shape\":\"{:?}\",\"e_r\":{},\"e_far\":{},\"e_area\":{},\"map_ready\":{},\"map\":{},\"e_field\":{},\"e_circle\":{},\"e_square\":{},\"e_near\":{},\"e_far_btn\":{},\"e_slider\":{},\"e_save\":{},\"e_cancel\":{}",
+            e.name, e.typing, e.shape, e.r, e.far, e.area(), ready, r(el.map), r(el.name), r(el.circle), r(el.square), r(el.near), r(el.far), r(el.slider), r(el.save), r(el.cancel)
+        ));
+    }
+    let mut path = std::path::PathBuf::from(trace);
+    path.as_mut_os_string().push(".rows.json");
+    let _ = std::fs::write(path, format!("{{\"layout\":{{{layout}}},\"rows\":[]}}"));
+}
+
 fn row_id(row: &Row) -> String {
     match &row.key {
         Key::Group(g) => format!("g:{g}"),
@@ -1641,9 +2431,12 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
         host.fill(b, [cx, s[1] + 4.0, 1.0, 8.0], argb(TEXT));
     }
 
-    // Tabs with counts; the ones not built yet are faint and do nothing.
+    // Tabs with counts; inside a zone, its header and sub-tabs instead.
     let t = lay.tabs;
-    for (i, tab) in Tab::ORDER.iter().enumerate() {
+    if st.zone_mode() {
+        draw_zone_head(st, host, b, &lay, mouse);
+    }
+    for (i, tab) in Tab::ORDER.iter().enumerate().filter(|_| !st.zone_mode()) {
         let r = lay.tab_rects[i];
         let x = r[0] + 3.0;
         let label = tr(tab_key(*tab));
@@ -1667,6 +2460,10 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
         }
     }
     host.fill(b, [p[0] + 1.0, t[1] + t[3], p[2] - 2.0, 1.0], EDGE);
+    if st.list.tab == Tab::Zones && !st.zone_mode() {
+        draw_zones(st, host, b, &lay, mouse, now_ms);
+        return;
+    }
 
     // Category chips: picked ones are filled and move to the front.
     let order = st.list.chip_order();

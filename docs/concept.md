@@ -43,10 +43,10 @@ The player wants to see what they have changed. A "Changed" view shows only adju
 - Highlight a row while its sound is playing.
 - Settings saved between sessions.
 - Profiles: named sets of settings, one active at a time.
+- Zones: places in the world whose sounds get their own volumes.
 
 ## Not in the first version
 
 - Making sounds louder than normal.
-- Settings tied to places in the world.
 - Spatial visualisation of where sounds come from.
 - A real audio level meter.

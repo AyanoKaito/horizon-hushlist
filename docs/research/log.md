@@ -2,6 +2,18 @@
 
 Dated record of what was checked and what it proved. Each entry separates what was confirmed from what was not.
 
+## 2026-11-08 — Zones, part 1 (circle and square)
+
+**Pin:** Horizon Nightly `6560641ba51a452f6bc2407baa4eb1b3be517ca8`.
+
+**Change:** the Zones tab lists the zones of the world played now and makes new ones. The editor shows a map of the terrain around the player (the game's map colours, 64 or 128 blocks across) with the zone painted block by block, a circle or a square, a radius from 2 to 64, and a name. Inside a zone, the list has "Recent here", All and Changed; settings there apply only to sounds that start in the zone. Edit shape and Delete (with a question) are in the zone's header.
+
+**Findings:** the client can read loaded blocks around the player and each block's map colour, which is enough for the map. The world played now is known by its save folder or server address. The recent list keeps only where each sound last played, so the zone's "Recent here" needs a list of its own: the same chicken sound played inside and outside the zone in turn.
+
+**Confirmed** (isolated offscreen runs, English and Russian): chickens without AI stood 2 to 3 blocks from the player and 11 to 13 blocks away; a radius-6 circle zone was made around the player; muting the chicken group inside the zone wrote only to the zone file; over 25 seconds every inside chicken call played at volume 0 and every outside call at full volume. The map loaded at both scales; renaming, edit and cancel, and delete with its question worked. The screen (21), profiles (19) and Mods page (11) checks still pass (Russian).
+
+**Not confirmed:** frame time with the editor open; overlapping zones in game (unit tests only); zones on servers; the map for zones far from the player (unloaded terrain shows dark).
+
 ## 2026-11-08 — Profiles
 
 **Pin:** Horizon Nightly `6560641ba51a452f6bc2407baa4eb1b3be517ca8`.

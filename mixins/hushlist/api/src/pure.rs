@@ -4,3 +4,4 @@ pub mod core;
 pub mod i18n;
 pub mod ui;
 pub mod profiles;
+pub mod zones;

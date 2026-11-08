@@ -123,7 +123,7 @@ impl Tab {
     pub const ORDER: [Tab; 4] = [Tab::Recent, Tab::All, Tab::Changed, Tab::Zones];
     /// Tabs that can be opened so far.
     pub fn ready(self) -> bool {
-        matches!(self, Tab::Recent | Tab::All | Tab::Changed)
+        matches!(self, Tab::Recent | Tab::All | Tab::Changed | Tab::Zones)
     }
 }
 
@@ -178,6 +178,10 @@ pub struct Measure {
     pub buttons: [f32; 3],
     /// The header's "Profile: ..." label, already cut to fit.
     pub profile: f32,
+    /// Inside a zone: where the sub-tabs start (after the back button and the zone name).
+    pub tab_lead: Option<f32>,
+    /// Inside a zone: a line under the tabs says the settings apply to the zone only.
+    pub zone_bar: bool,
 }
 
 impl Measure {
@@ -552,7 +556,7 @@ pub fn build(
 }
 
 fn cooldown_secs(settings: &Settings, id: &str) -> u32 {
-    settings.cooldowns.get(id).copied().unwrap_or(0)
+    settings.cooldown_secs(id)
 }
 
 fn cooldown_row(id: &str, child: bool, settings: &Settings) -> Row {
@@ -840,6 +844,8 @@ pub struct Layout {
     /// Sort menu items while the menu is open, under the sort button.
     pub sort_menu: Vec<Rect>,
     pub banner: Option<Rect>,
+    /// Inside a zone: the line that says the settings apply to the zone only.
+    pub zone_bar: Option<Rect>,
     pub list: Rect,
     pub freeze: Rect,
     /// The Freeze button exists (Recent only).
@@ -869,10 +875,14 @@ pub fn layout(width: f32, height: f32, banner: bool, m: &Measure, st: &ListState
     let search = [search_x, y + 6.0, (close[0] - 8.0 - search_x).max(40.0), 16.0];
     let search_clear = [search[0] + search[2] - 16.0, search[1], 16.0, 16.0];
     let tabs = [x + pad, y + 28.0, w - 2.0 * pad, 16.0];
-    let tools_top = y + 52.0;
+    let zone_bar = m.zone_bar.then(|| [x + pad, y + 48.0, w - 2.0 * pad, 12.0]);
+    let tools_top = y + 52.0 + if m.zone_bar { 16.0 } else { 0.0 };
     let mut tab_rects = [[0.0; 4]; 4];
-    let mut tx = tabs[0] + 2.0;
+    let mut tx = m.tab_lead.unwrap_or(tabs[0] + 2.0);
     for (i, tw) in m.tabs.iter().enumerate() {
+        if *tw <= 0.0 {
+            continue;
+        }
         tab_rects[i] = [tx - 3.0, tabs[1], tw + 6.0, tabs[3]];
         tx += tw + 16.0;
     }
@@ -929,6 +939,7 @@ pub fn layout(width: f32, height: f32, banner: bool, m: &Measure, st: &ListState
         sort,
         sort_menu,
         banner,
+        zone_bar,
         list: [x + pad, top, w - 2.0 * pad, (foot_y - 6.0 - top).max(0.0)],
         freeze,
         show_freeze: st.tab == Tab::Recent,

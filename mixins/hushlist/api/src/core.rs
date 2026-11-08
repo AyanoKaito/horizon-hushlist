@@ -53,6 +53,8 @@ pub struct Settings {
     /// When each setting was last changed, Unix seconds, by `"<kind> <key>"`
     /// (`"sound entity.cow.ambient"`). Optional fourth field of a line; sorts "Recently changed".
     pub stamps: HashMap<String, u64>,
+    /// Settings under these ones: what a zone's untouched sounds follow. Display only, never saved.
+    pub base: Option<Box<Settings>>,
 }
 
 impl Settings {
@@ -121,20 +123,35 @@ impl Settings {
         lines.join("\n") + "\n"
     }
 
-    /// Effective volume in percent: the sound's own value, else its group's, else 100.
+    /// Effective volume in percent: the sound's own value, else its group's, else the base's, else 100.
     pub fn volume_percent(&self, id: &str) -> u8 {
-        let id = normalize(id);
-        if let Some(v) = self.sounds.get(id) {
-            return *v;
-        }
-        group_key(id)
-            .and_then(|g| self.groups.get(&g).copied())
-            .unwrap_or(100)
+        self.own_percent(id)
+            .unwrap_or_else(|| self.base.as_ref().map_or(100, |b| b.volume_percent(id)))
     }
 
-    /// Group volume in percent (100 when the group has none).
+    /// The volume set here for the sound or its group, if any.
+    pub fn own_percent(&self, id: &str) -> Option<u8> {
+        let id = normalize(id);
+        if let Some(v) = self.sounds.get(id) {
+            return Some(*v);
+        }
+        group_key(id).and_then(|g| self.groups.get(&g).copied())
+    }
+
+    /// Group volume in percent: set here, else the base's, else 100.
     pub fn group_percent(&self, group: &str) -> u8 {
-        self.groups.get(group).copied().unwrap_or(100)
+        match self.groups.get(group) {
+            Some(v) => *v,
+            None => self.base.as_ref().map_or(100, |b| b.group_percent(group)),
+        }
+    }
+
+    /// Cooldown seconds: set here, else the base's, else 0.
+    pub fn cooldown_secs(&self, id: &str) -> u32 {
+        match self.cooldowns.get(normalize(id)) {
+            Some(s) => *s,
+            None => self.base.as_ref().map_or(0, |b| b.cooldown_secs(id)),
+        }
     }
 
     /// Effective volume as a multiplier of the game's volume.
@@ -143,9 +160,10 @@ impl Settings {
     }
 
     pub fn cooldown(&self, id: &str) -> Option<Duration> {
-        self.cooldowns
-            .get(normalize(id))
-            .map(|s| Duration::from_secs(u64::from(*s)))
+        match self.cooldown_secs(id) {
+            0 => None,
+            s => Some(Duration::from_secs(u64::from(s))),
+        }
     }
 
     /// How many settings there are (the Changed tab's count).
@@ -295,6 +313,13 @@ pub struct Engine {
     pub settings: Settings,
     pub recent: Recent,
     last_start: HashMap<String, Instant>,
+    /// Zones of the active profile, every world.
+    pub zones: Vec<crate::zones::Zone>,
+    /// The world played now ([`crate::zones::Zone::world`]); zones of other worlds do nothing.
+    pub world: Option<String>,
+    /// Sounds heard from each zone (by zone id), for its "Recent here": the main list keeps only
+    /// where a sound played last, and the same sound may play inside and outside a zone in turn.
+    pub zone_recent: HashMap<u32, Recent>,
 }
 
 impl Engine {
@@ -305,12 +330,24 @@ impl Engine {
         id: &str,
         source: usize,
         position: [f64; 3],
+        relative: bool,
         starting: bool,
         now: Instant,
     ) -> Decision {
         let id = normalize(id);
+        // A sound placed relative to the listener (music, the interface) comes from no place.
+        let zone = if relative { None } else { self.zone_at(position) };
+        let (volume, cooldown) = match zone.map(|i| &self.zones[i].settings) {
+            Some(z) => (
+                z.own_percent(id).unwrap_or_else(|| self.settings.volume_percent(id)),
+                z.cooldown(id).or_else(|| self.settings.cooldown(id)),
+            ),
+            None => (self.settings.volume_percent(id), self.settings.cooldown(id)),
+        };
+        // The recent list keeps where a sound came from, for "Recent here"; a relative one came from nowhere.
+        let position = if relative { [f64::NAN; 3] } else { position };
         if starting {
-            if let Some(cooldown) = self.settings.cooldown(id)
+            if let Some(cooldown) = cooldown
                 && let Some(last) = self.last_start.get(id)
                 && now.saturating_duration_since(*last) < cooldown
             {
@@ -324,10 +361,35 @@ impl Engine {
         } else {
             self.recent.touch(id, position, now);
         }
+        if let Some(zid) = zone.map(|i| self.zones[i].id) {
+            let here = self.zone_recent.entry(zid).or_default();
+            if starting {
+                here.record(id, source, position, now);
+            } else {
+                here.touch(id, position, now);
+            }
+        }
         Decision {
-            factor: self.settings.volume_factor(id),
+            factor: f32::from(volume) / 100.0,
             cancel: false,
         }
+    }
+
+    /// The zone a sound at `position` belongs to: the smallest one of this world that holds it.
+    pub fn zone_at(&self, position: [f64; 3]) -> Option<usize> {
+        let world = self.world.as_deref()?;
+        crate::zones::smallest_at(&self.zones, world, position)
+    }
+
+    /// The volume factor a sound would get now, without recording it (live re-apply).
+    pub fn factor(&self, id: &str, position: [f64; 3], relative: bool) -> f32 {
+        let id = normalize(id);
+        let zone = if relative { None } else { self.zone_at(position) };
+        let v = match zone {
+            Some(i) => self.zones[i].settings.own_percent(id).unwrap_or_else(|| self.settings.volume_percent(id)),
+            None => self.settings.volume_percent(id),
+        };
+        f32::from(v) / 100.0
     }
 }
 
@@ -415,17 +477,17 @@ mod tests {
         let mut e = Engine::default();
         e.settings = Settings::parse("cooldown entity.villager.ambient 10\n");
         let id = "minecraft:entity.villager.ambient";
-        assert!(!e.decide(id, 6, [0.0; 3], true, t0).cancel);
-        assert!(e.decide(id, 6, [0.0; 3], true, at(t0, 4)).cancel);
-        assert!(e.decide(id, 6, [0.0; 3], true, at(t0, 9)).cancel);
-        assert!(!e.decide(id, 6, [0.0; 3], true, at(t0, 10)).cancel);
+        assert!(!e.decide(id, 6, [0.0; 3], false, true, t0).cancel);
+        assert!(e.decide(id, 6, [0.0; 3], false, true, at(t0, 4)).cancel);
+        assert!(e.decide(id, 6, [0.0; 3], false, true, at(t0, 9)).cancel);
+        assert!(!e.decide(id, 6, [0.0; 3], false, true, at(t0, 10)).cancel);
         // The pause restarts from the last start that actually played.
-        assert!(e.decide(id, 6, [0.0; 3], true, at(t0, 15)).cancel);
-        assert!(!e.decide(id, 6, [0.0; 3], true, at(t0, 20)).cancel);
+        assert!(e.decide(id, 6, [0.0; 3], false, true, at(t0, 15)).cancel);
+        assert!(!e.decide(id, 6, [0.0; 3], false, true, at(t0, 20)).cancel);
         // Live updates of a playing sound are never cancelled.
-        assert!(!e.decide(id, 6, [0.0; 3], false, at(t0, 21)).cancel);
+        assert!(!e.decide(id, 6, [0.0; 3], false, false, at(t0, 21)).cancel);
         // Other sounds are not affected.
-        assert!(!e.decide("entity.villager.trade", 6, [0.0; 3], true, at(t0, 21)).cancel);
+        assert!(!e.decide("entity.villager.trade", 6, [0.0; 3], false, true, at(t0, 21)).cancel);
     }
 
     #[test]
@@ -433,8 +495,8 @@ mod tests {
         let t0 = Instant::now();
         let mut e = Engine::default();
         e.settings = Settings::parse("cooldown a.b.c 10\n");
-        e.decide("a.b.c", 0, [0.0; 3], true, t0);
-        e.decide("a.b.c", 0, [0.0; 3], true, at(t0, 1));
+        e.decide("a.b.c", 0, [0.0; 3], false, true, t0);
+        e.decide("a.b.c", 0, [0.0; 3], false, true, at(t0, 1));
         assert_eq!(e.recent.list()[0].count, 1);
     }
 
@@ -442,12 +504,12 @@ mod tests {
     fn live_updates_mark_a_sound_as_playing() {
         let t0 = Instant::now();
         let mut e = Engine::default();
-        e.decide("weather.rain", 3, [0.0; 3], true, t0);
+        e.decide("weather.rain", 3, [0.0; 3], false, true, t0);
         assert!(!e.recent.get("weather.rain").unwrap().playing(t0));
         // Updated for half a second: a mob sound following its mob, not a long sound.
-        e.decide("weather.rain", 3, [0.5; 3], false, t0 + Duration::from_millis(500));
+        e.decide("weather.rain", 3, [0.5; 3], false, false, t0 + Duration::from_millis(500));
         assert!(!e.recent.get("weather.rain").unwrap().playing(t0 + Duration::from_millis(550)));
-        e.decide("weather.rain", 3, [1.0; 3], false, t0 + Duration::from_millis(1600));
+        e.decide("weather.rain", 3, [1.0; 3], false, false, t0 + Duration::from_millis(1600));
         let h = e.recent.get("weather.rain").unwrap();
         assert!(h.playing(t0 + Duration::from_millis(1700)));
         assert!(!h.playing(t0 + Duration::from_secs(3)));
@@ -497,11 +559,11 @@ mod tests {
         let t0 = Instant::now();
         let mut e = Engine::default();
         let id = "block.portal.ambient";
-        assert_eq!(e.decide(id, 4, [0.0; 3], true, t0).factor, 1.0);
+        assert_eq!(e.decide(id, 4, [0.0; 3], false, true, t0).factor, 1.0);
         e.settings = Settings::parse("group block.portal 20\n");
-        assert!((e.decide(id, 4, [0.0; 3], false, at(t0, 1)).factor - 0.2).abs() < 1e-6);
+        assert!((e.decide(id, 4, [0.0; 3], false, false, at(t0, 1)).factor - 0.2).abs() < 1e-6);
         e.settings = Settings::parse("group block.portal 20\nsound block.portal.ambient 0\n");
-        assert_eq!(e.decide(id, 4, [0.0; 3], false, at(t0, 2)).factor, 0.0);
+        assert_eq!(e.decide(id, 4, [0.0; 3], false, false, at(t0, 2)).factor, 0.0);
     }
 
     #[test]
