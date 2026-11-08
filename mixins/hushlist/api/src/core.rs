@@ -50,6 +50,9 @@ pub struct Settings {
     pub groups: HashMap<String, u8>,
     /// Minimum pause after a sound starts before it may start again, in seconds.
     pub cooldowns: HashMap<String, u32>,
+    /// When each setting was last changed, Unix seconds, by `"<kind> <key>"`
+    /// (`"sound entity.cow.ambient"`). Optional fourth field of a line; sorts "Recently changed".
+    pub stamps: HashMap<String, u64>,
 }
 
 impl Settings {
@@ -63,15 +66,26 @@ impl Settings {
                 continue;
             }
             let mut fields = line.split_whitespace();
-            let (Some(kind), Some(key), Some(value), None) =
-                (fields.next(), fields.next(), fields.next(), fields.next())
+            let (Some(kind), Some(key), Some(value), stamp, None) =
+                (fields.next(), fields.next(), fields.next(), fields.next(), fields.next())
             else {
                 continue;
+            };
+            let stamp = match stamp.map(str::parse::<u64>) {
+                Some(Ok(s)) => Some(s),
+                Some(Err(_)) => continue,
+                None => None,
             };
             let Ok(number) = value.parse::<u32>() else {
                 continue;
             };
             let key = normalize(key).to_owned();
+            if let Some(s) = stamp
+                && matches!(kind, "sound" | "group" | "cooldown")
+                && (kind != "cooldown" || number > 0)
+            {
+                settings.stamps.insert(format!("{kind} {key}"), s);
+            }
             match kind {
                 "sound" => {
                     settings.sounds.insert(key, number.min(100) as u8);
@@ -91,15 +105,19 @@ impl Settings {
     /// Deterministic text form: one setting per line, sorted.
     pub fn to_text(&self) -> String {
         let mut lines = vec!["# Hushlist settings".to_owned()];
+        let line = |kind: &str, k: &str, v: String| match self.stamps.get(&format!("{kind} {k}")) {
+            Some(s) => format!("{kind} {k} {v} {s}"),
+            None => format!("{kind} {k} {v}"),
+        };
         let mut groups: Vec<_> = self.groups.iter().collect();
         groups.sort();
-        lines.extend(groups.into_iter().map(|(k, v)| format!("group {k} {v}")));
+        lines.extend(groups.into_iter().map(|(k, v)| line("group", k, v.to_string())));
         let mut sounds: Vec<_> = self.sounds.iter().collect();
         sounds.sort();
-        lines.extend(sounds.into_iter().map(|(k, v)| format!("sound {k} {v}")));
+        lines.extend(sounds.into_iter().map(|(k, v)| line("sound", k, v.to_string())));
         let mut cooldowns: Vec<_> = self.cooldowns.iter().collect();
         cooldowns.sort();
-        lines.extend(cooldowns.into_iter().map(|(k, v)| format!("cooldown {k} {v}")));
+        lines.extend(cooldowns.into_iter().map(|(k, v)| line("cooldown", k, v.to_string())));
         lines.join("\n") + "\n"
     }
 
@@ -128,6 +146,22 @@ impl Settings {
         self.cooldowns
             .get(normalize(id))
             .map(|s| Duration::from_secs(u64::from(*s)))
+    }
+
+    /// How many settings there are (the Changed tab's count).
+    pub fn count(&self) -> usize {
+        self.sounds.len() + self.groups.len() + self.cooldowns.len()
+    }
+
+    /// Latest change of anything set on this sound (volume or cooldown), Unix seconds.
+    pub fn sound_stamp(&self, id: &str) -> u64 {
+        let a = self.stamps.get(&format!("sound {id}")).copied().unwrap_or(0);
+        let b = self.stamps.get(&format!("cooldown {id}")).copied().unwrap_or(0);
+        a.max(b)
+    }
+
+    pub fn group_stamp(&self, group: &str) -> u64 {
+        self.stamps.get(&format!("group {group}")).copied().unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -362,6 +396,17 @@ mod tests {
         assert_eq!(Settings::parse(&text), s);
         assert_eq!(text, Settings::parse(&text).to_text());
         assert!(text.find("group a.b").unwrap() < text.find("sound a.b.c").unwrap());
+    }
+
+    #[test]
+    fn change_times_are_optional_and_kept() {
+        let s = Settings::parse("sound a.b.c 40 1700000000\ngroup a.b 20\ncooldown a.b.c 10 1700000500\nsound a.b.d 5 x\n");
+        assert_eq!(s.sounds.get("a.b.d"), None);
+        assert_eq!(s.sound_stamp("a.b.c"), 1700000500);
+        assert_eq!(s.group_stamp("a.b"), 0);
+        assert_eq!(s.count(), 3);
+        assert_eq!(Settings::parse(&s.to_text()), s);
+        assert!(s.to_text().contains("sound a.b.c 40 1700000000\n"));
     }
 
     #[test]

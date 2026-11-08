@@ -27,6 +27,16 @@ search.placeholder=Название, ID или категория
 empty.nothing=Ничего не найдено
 group.from=из группы “{name}”
 
+# Changed tab
+sort.alpha=По алфавиту
+sort.recent=Недавно изменённые
+changed.count=Изменено: {n}
+changed.none=Вы ещё ничего не меняли
+changed.reset_all=Сбросить всё
+changed.reset_q=Сбросить все изменения? Громкость вернётся к 100%, а звуки будут звучать так же часто, как в игре.
+button.reset=Сбросить
+button.cancel=Отмена
+
 # Less often (cooldown)
 cooldown.label=Реже
 cooldown.off=как в игре

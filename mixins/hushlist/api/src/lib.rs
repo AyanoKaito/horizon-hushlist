@@ -5,7 +5,7 @@ mod i18n;
 mod ui;
 
 use crate::core::{Engine, MOD_ID, MOD_VERSION, SETTINGS_FILE, Settings, group_key, normalize, nudged};
-use crate::ui::{Hit, HeardView, Key, ListState, Rect, Row, approach, fade, mix};
+use crate::ui::{Hit, HeardView, Key, ListState, Rect, Row, SortChanged, Tab, approach, fade, mix};
 use horizon_client::lang;
 use horizon_client::mod_api::{
     ClientTickPostEvent, Flow, Hooks, Host, HudBatch, KeyEvent, ModsEvent, NativeMod,
@@ -50,6 +50,8 @@ const ICE_TEXT: u32 = 0x12_30_3F;
 const FIELD: u32 = 0xFF_0E_0D_12;
 const FIELD_EDGE_FOCUS: u32 = 0x55_FF_FF_FF;
 const CHIP_ON_TEXT: u32 = 0x17_15_1E;
+const DANGER: u32 = 0xFF_8A_7A;
+const MENU: u32 = 0xFC_22_20_2A;
 
 // Icon sheet (tools/make_icons.py): one column per icon, one row per colour,
 // 24 px cells drawn into 12 GUI pixels. Uploaded into the mods' image slot.
@@ -72,6 +74,7 @@ enum Icon {
     ChevronDown = 9,
     ViewList = 10,
     ViewGroups = 11,
+    Sort = 12,
     Search = 13,
 }
 
@@ -136,6 +139,8 @@ struct State {
     rows_dumped: Option<Instant>,
     /// Cooldown badges drawn in the last frame, with their sound: a click opens the drawer.
     badges: Vec<(Rect, String)>,
+    /// Tab counts: heard recently, sounds in the game, settings.
+    counts: [usize; 3],
     /// When the live order was last refreshed.
     live_at: Option<Instant>,
 }
@@ -270,6 +275,16 @@ impl State {
 
     fn rows(&mut self, now: Instant) -> (Vec<HeardView>, Vec<Row>, usize) {
         let views = self.views(now);
+        self.counts = [views.len(), self.catalog.total, self.engine.settings.count()];
+        if self.list.tab == Tab::Changed {
+            let name = |k: &Key| match k {
+                Key::Group(g) => group_name(g),
+                Key::Sound(s) => sound_name(&self.subtitles, s),
+                Key::More(_) | Key::Cooldown(_) => String::new(),
+            };
+            let rows = ui::build_changed(&views, &self.engine.settings, &self.list, &self.catalog, &self.matcher(), &name);
+            return (views, rows, 0);
+        }
         // The live order waits while a slider is held, so the row does not move under the pointer.
         if !self.list.frozen
             && self.drag.is_none()
@@ -334,13 +349,20 @@ impl State {
     /// The screen layout for this GUI size; chips are measured in the game's font.
     fn layout(&self, host: &dyn Host, fresh: usize) -> ui::Layout {
         let code = lang::code();
-        let widths: Vec<f32> = self
-            .list
-            .chip_order()
-            .iter()
-            .map(|s| host.text_width(i18n::text(&code, ui::category_key(*s).unwrap_or_default())))
-            .collect();
-        ui::layout(self.gui[0], self.gui[1], self.list.frozen && fresh > 0, &widths)
+        let w = |key: &'static str| host.text_width(i18n::text(&code, key));
+        let chips = self.list.chip_order().iter().map(|s| w(ui::category_key(*s).unwrap_or_default())).collect();
+        let mut tabs = [0.0; 4];
+        for (i, t) in Tab::ORDER.iter().enumerate() {
+            tabs[i] = host.text_width(&tab_label(*t, &self.counts));
+        }
+        let m = ui::Measure {
+            chips,
+            tabs,
+            sort_items: SortChanged::ORDER.iter().map(|s| w(s.key())).collect(),
+            buttons: [w("changed.reset_all"), w("button.reset"), w("button.cancel")],
+        };
+        let banner = self.list.tab == Tab::Recent && self.list.frozen && fresh > 0;
+        ui::layout(self.gui[0], self.gui[1], banner, &m, &self.list)
     }
 
     fn changed(&mut self, now: Instant) {
@@ -354,6 +376,11 @@ impl State {
     fn set_volume(&mut self, key: &Key, value: u8, now: Instant) {
         let s = &mut self.engine.settings;
         match key {
+            Key::Sound(id) => s.stamps.insert(format!("sound {id}"), unix_now()),
+            Key::Group(g) => s.stamps.insert(format!("group {g}"), unix_now()),
+            Key::More(_) | Key::Cooldown(_) => return,
+        };
+        match key {
             Key::Sound(id) => s.sounds.insert(id.clone(), value),
             Key::Group(g) => s.groups.insert(g.clone(), value),
             Key::More(_) | Key::Cooldown(_) => return,
@@ -363,6 +390,11 @@ impl State {
 
     fn reset(&mut self, key: &Key, now: Instant) {
         let s = &mut self.engine.settings;
+        match key {
+            Key::Sound(id) => s.stamps.remove(&format!("sound {id}")),
+            Key::Group(g) => s.stamps.remove(&format!("group {g}")),
+            Key::More(_) | Key::Cooldown(_) => return,
+        };
         match key {
             Key::Sound(id) => s.sounds.remove(id),
             Key::Group(g) => s.groups.remove(g),
@@ -374,11 +406,13 @@ impl State {
 
     /// Sets a sound's cooldown (0 removes it). It applies to the next start, so only the file changes.
     fn set_cooldown(&mut self, id: &str, secs: u32, now: Instant) {
-        let c = &mut self.engine.settings.cooldowns;
+        let s = &mut self.engine.settings;
         if secs == 0 {
-            c.remove(id);
+            s.cooldowns.remove(id);
+            s.stamps.remove(&format!("cooldown {id}"));
         } else {
-            c.insert(id.to_owned(), secs);
+            s.cooldowns.insert(id.to_owned(), secs);
+            s.stamps.insert(format!("cooldown {id}"), unix_now());
         }
         self.dirty_at = Some(now);
     }
@@ -601,8 +635,37 @@ impl Hooks for Hushlist {
         let hit = ui::hit(&lay, &rows, st.list.scroll, event.screen.mouse);
         // A click anywhere else gives the keyboard back to the game's keys.
         st.list.search_focus = matches!(hit, Hit::Search | Hit::SearchClear);
+        if !matches!(hit, Hit::Sort | Hit::SortItem(_)) {
+            st.list.sort_open = false;
+        }
+        if !matches!(hit, Hit::ResetAll | Hit::ConfirmYes | Hit::ConfirmNo) {
+            st.list.confirm_reset = false;
+        }
         match hit {
             Hit::Close => st.close = true,
+            Hit::Tab(i) => {
+                let tab = Tab::ORDER[i];
+                if tab.ready() && tab != st.list.tab {
+                    st.list.tab = tab;
+                    st.filter_changed(now);
+                    st.anim.y.clear();
+                    st.anim.reveal.clear();
+                }
+            }
+            Hit::Sort => st.list.sort_open = !st.list.sort_open,
+            Hit::SortItem(i) => {
+                st.list.sort_changed = SortChanged::ORDER[i];
+                st.list.sort_open = false;
+            }
+            Hit::SortClose => {}
+            Hit::ResetAll => st.list.confirm_reset = true,
+            Hit::ConfirmNo => st.list.confirm_reset = false,
+            Hit::ConfirmYes => {
+                st.list.confirm_reset = false;
+                st.engine.settings = Settings::default();
+                st.list.before_mute.clear();
+                st.changed(now);
+            }
             Hit::Search => {}
             Hit::SearchClear => {
                 if !st.list.query.is_empty() {
@@ -657,7 +720,7 @@ impl Hooks for Hushlist {
             Hit::Row(i) => match &rows[i].key {
                 Key::Group(g) => {
                     let open = !rows[i].open;
-                    st.list.open.insert(g.clone(), open);
+                    st.list.set_group_open(g, open);
                 }
                 Key::Sound(id) => st.preview = Some(id.clone()),
                 Key::More(g) => {
@@ -871,12 +934,116 @@ fn dump_rows(st: &mut State, rows: &[Row], lay: &ui::Layout, now: Instant) {
     let chips: Vec<String> = lay.chips.iter().map(|c| r(*c)).collect();
     let chip_ids: Vec<String> = st.list.chip_order().iter().map(|s| s.to_string()).collect();
     let layout = format!(
-        "{{\"search\":{},\"search_clear\":{},\"close\":{},\"chips\":[{}],\"chip_sources\":[{}],\"view_flat\":{},\"view_group\":{},\"banner\":{},\"list\":{},\"freeze\":{},\"query\":{:?},\"focus\":{},\"flat\":{}}}",
+        "{{\"search\":{},\"search_clear\":{},\"close\":{},\"chips\":[{}],\"chip_sources\":[{}],\"view_flat\":{},\"view_group\":{},\"banner\":{},\"list\":{},\"freeze\":{},\"query\":{:?},\"focus\":{},\"flat\":{},\"tab\":\"{:?}\",\"tabs\":[{}],\"sort\":{},\"sort_menu\":[{}],\"reset_all\":{},\"confirm_yes\":{},\"confirm_no\":{}}}",
         r(lay.search), r(lay.search_clear), r(lay.close), chips.join(","), chip_ids.join(","), r(lay.view_flat),
         r(lay.view_group), lay.banner.map_or("null".to_owned(), r), r(lay.list), r(lay.freeze), st.list.query,
-        st.list.search_focus, st.list.flat
+        st.list.search_focus, st.list.flat, st.list.tab,
+        lay.tab_rects.iter().map(|t| r(*t)).collect::<Vec<_>>().join(","),
+        lay.sort.map_or("null".to_owned(), r),
+        lay.sort_menu.iter().map(|t| r(*t)).collect::<Vec<_>>().join(","),
+        lay.reset_all.map_or("null".to_owned(), r),
+        lay.confirm_yes.map_or("null".to_owned(), r),
+        lay.confirm_no.map_or("null".to_owned(), r)
     );
     let _ = std::fs::write(path, format!("{{\"layout\":{layout},\"rows\":[{}]}}", items.join(",")));
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+fn tab_key(tab: Tab) -> &'static str {
+    match tab {
+        Tab::Recent => "tab.recent",
+        Tab::All => "tab.all",
+        Tab::Changed => "tab.changed",
+        Tab::Zones => "tab.zones",
+    }
+}
+
+fn tab_count(tab: Tab, counts: &[usize; 3]) -> Option<usize> {
+    match tab {
+        Tab::Recent => Some(counts[0]),
+        Tab::All => Some(counts[1]),
+        Tab::Changed => Some(counts[2]),
+        Tab::Zones => None,
+    }
+}
+
+/// A tab's label with its count, as measured for the layout.
+fn tab_label(tab: Tab, counts: &[usize; 3]) -> String {
+    let label = tr(tab_key(tab));
+    match tab_count(tab, counts) {
+        Some(n) => format!("{label} {n}"),
+        None => label.to_owned(),
+    }
+}
+
+/// An outlined button with a centred label.
+fn button(host: &dyn Host, b: &mut HudBatch, r: Rect, label: &str, rgb: u32, edge: u32, hover: bool) {
+    rrect(host, b, r, 3.0, if hover { mix(edge, 0xFF_FF_FF_FF, 0.25) } else { edge });
+    rrect(host, b, [r[0] + 1.0, r[1] + 1.0, r[2] - 2.0, r[3] - 2.0], 2.0, argb(if hover { 0x24_22_2C } else { 0x16_15_1B }));
+    host.text(b, label, [r[0] + (r[2] - host.text_width(label)) / 2.0, r[1] + 5.0], rgb, false);
+}
+
+/// The Changed tab's footer: how many changes, and "Reset all" with its confirmation.
+fn draw_footer(st: &State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layout, mouse: [f32; 2]) {
+    if st.list.tab != Tab::Changed {
+        return;
+    }
+    let code = lang::code();
+    let at = lay.foot_text;
+    if let (Some(yes), Some(no)) = (lay.confirm_yes, lay.confirm_no) {
+        // The question takes two lines when it does not fit in one.
+        let room = yes[0] - 8.0 - at[0];
+        let q = tr("changed.reset_q");
+        if host.text_width(q) <= room {
+            host.text(b, q, at, TEXT, false);
+        } else {
+            let mut first = String::new();
+            let mut words = q.split(' ').peekable();
+            while let Some(word) = words.peek() {
+                let next = if first.is_empty() { (*word).to_owned() } else { format!("{first} {word}") };
+                if host.text_width(&next) > room && !first.is_empty() {
+                    break;
+                }
+                first = next;
+                words.next();
+            }
+            let rest: Vec<&str> = words.collect();
+            host.text(b, &first, [at[0], at[1] - 5.0], TEXT, false);
+            host.text(b, &fit(host, &rest.join(" "), room), [at[0], at[1] + 4.0], DIM, false);
+        }
+        button(host, b, yes, tr("button.reset"), DANGER, 0x80_FF_8A_7A, ui::contains(yes, mouse));
+        button(host, b, no, tr("button.cancel"), TEXT, EDGE, ui::contains(no, mouse));
+        return;
+    }
+    let n = st.engine.settings.count();
+    if n == 0 {
+        host.text(b, tr("changed.none"), at, DIM, false);
+        return;
+    }
+    host.text(b, &i18n::with_n(&code, "changed.count", n), at, DIM, false);
+    if let Some(r) = lay.reset_all {
+        button(host, b, r, tr("changed.reset_all"), TEXT, EDGE, ui::contains(r, mouse));
+    }
+}
+
+/// The sort menu, drawn over the list.
+fn draw_sort_menu(st: &State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layout, mouse: [f32; 2]) {
+    let Some(first) = lay.sort_menu.first() else { return };
+    let last = lay.sort_menu[lay.sort_menu.len() - 1];
+    let panel = [first[0] - 3.0, first[1] - 3.0, first[2] + 6.0, last[1] + last[3] - first[1] + 6.0];
+    rrect(host, b, [panel[0] - 1.0, panel[1] - 1.0, panel[2] + 2.0, panel[3] + 2.0], 5.0, 0x30_FF_FF_FF);
+    rrect(host, b, panel, 4.0, MENU);
+    for (r, item) in lay.sort_menu.iter().zip(SortChanged::ORDER) {
+        let on = item == st.list.sort_changed;
+        let hover = ui::contains(*r, mouse);
+        if on || hover {
+            rrect(host, b, *r, 3.0, if on { 0x24_FF_FF_FF } else { 0x14_FF_FF_FF });
+        }
+        host.text(b, tr(item.key()), [r[0] + 8.0, r[1] + 3.0], if on || hover { TEXT } else { DIM }, false);
+    }
 }
 
 fn row_id(row: &Row) -> String {
@@ -964,19 +1131,30 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
         host.fill(b, [cx, s[1] + 3.0, 1.0, 8.0], argb(TEXT));
     }
 
-    // Tabs: only Recent exists so far.
+    // Tabs with counts; the ones not built yet are faint and do nothing.
     let t = lay.tabs;
-    let mut x = t[0] + 2.0;
-    for (i, label) in [tr("tab.recent"), tr("tab.all"), tr("tab.changed"), tr("tab.zones")]
-        .into_iter()
-        .enumerate()
-    {
-        let w = host.text_width(label);
-        host.text(b, label, [x, t[1] + 2.0], if i == 0 { TEXT } else { FAINT }, false);
-        if i == 0 {
-            rrect(host, b, [x - 1.0, t[1] + t[3] - 2.0, w + 2.0, 2.0], 1.0, argb(TEXT));
+    for (i, tab) in Tab::ORDER.iter().enumerate() {
+        let r = lay.tab_rects[i];
+        let x = r[0] + 3.0;
+        let label = tr(tab_key(*tab));
+        let active = *tab == st.list.tab;
+        let rgb = if active {
+            TEXT
+        } else if !tab.ready() {
+            FAINT
+        } else if ui::contains(r, mouse) {
+            TEXT
+        } else {
+            DIM
+        };
+        host.text(b, label, [x, t[1] + 2.0], rgb, false);
+        if let Some(n) = tab_count(*tab, &st.counts) {
+            let n = n.to_string();
+            host.text(b, &n, [x + host.text_width(label) + host.text_width(" "), t[1] + 2.0], FAINT, false);
         }
-        x += w + 14.0;
+        if active {
+            rrect(host, b, [x - 1.0, t[1] + t[3] - 2.0, r[2] - 4.0, 2.0], 1.0, argb(TEXT));
+        }
     }
     host.fill(b, [p[0] + 1.0, t[1] + t[3], p[2] - 2.0, 1.0], EDGE);
 
@@ -1007,6 +1185,12 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
         let tone = if active || ui::contains(r, mouse) { Tone::Text } else { Tone::Dim };
         icon(host, b, ic, tone, [r[0] + 2.0, r[1], ICON_SIZE, r[3]]);
     }
+    if let Some(s) = lay.sort {
+        let hot = st.list.sort_open || ui::contains(s, mouse);
+        rrect(host, b, s, 3.0, if hot { 0x40_FF_FF_FF } else { EDGE });
+        rrect(host, b, [s[0] + 1.0, s[1] + 1.0, s[2] - 2.0, s[3] - 2.0], 2.0, argb(if st.list.sort_open { 0x2E_2C_36 } else { 0x16_15_1B }));
+        icon(host, b, Icon::Sort, if hot { Tone::Text } else { Tone::Dim }, [s[0] + 2.0, s[1], ICON_SIZE, s[3]]);
+    }
 
     st.anim.banner = approach(st.anim.banner, if lay.banner.is_some() { 1.0 } else { 0.0 }, dt, 16.0);
     if let Some(r) = lay.banner {
@@ -1020,11 +1204,15 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
         host.text(b, hint, [r[0] + r[2] - host.text_width(hint) - 6.0, r[1] + 3.0], DIM, false);
     }
 
-    if rows.is_empty() && st.list.filtering() {
+    if rows.is_empty() && st.list.tab == Tab::Changed && !st.list.filtering() {
+        let l = lay.list;
+        let a = tr("changed.none");
+        host.text(b, a, [l[0] + (l[2] - host.text_width(a)) / 2.0, l[1] + 30.0], DIM, false);
+    } else if rows.is_empty() && st.list.filtering() {
         let l = lay.list;
         let a = tr("empty.nothing");
         host.text(b, a, [l[0] + (l[2] - host.text_width(a)) / 2.0, l[1] + 30.0], DIM, false);
-    } else if rows.is_empty() {
+    } else if rows.is_empty() && st.list.tab == Tab::Recent {
         let l = lay.list;
         let a = tr("empty.title");
         let c = tr("empty.text");
@@ -1251,6 +1439,11 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
     st.anim.hover.retain(|k, _| seen.contains(k));
     st.anim.volume.retain(|k, _| seen.contains(k));
 
+    draw_footer(st, host, b, &lay, mouse);
+    draw_sort_menu(st, host, b, &lay, mouse);
+    if !lay.show_freeze {
+        return;
+    }
     // Freeze: the button changes colour smoothly.
     let f = lay.freeze;
     st.anim.freeze = approach(st.anim.freeze, if st.list.frozen { 1.0 } else { 0.0 }, dt, 16.0);

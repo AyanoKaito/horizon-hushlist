@@ -27,6 +27,16 @@ search.placeholder=Name, ID or category
 empty.nothing=Nothing found
 group.from=from group “{name}”
 
+# Changed tab
+sort.alpha=A to Z
+sort.recent=Recently changed
+changed.count=Changed: {n}
+changed.none=Nothing changed yet
+changed.reset_all=Reset all
+changed.reset_q=Reset all changes? Volume returns to 100% and sounds play as often as in the game.
+button.reset=Reset
+button.cancel=Cancel
+
 # Less often (cooldown)
 cooldown.label=Less often
 cooldown.off=default

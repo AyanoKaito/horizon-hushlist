@@ -71,6 +71,61 @@ pub fn category_key(source: usize) -> Option<&'static str> {
     CATEGORIES.iter().find(|(s, _)| *s == source).map(|(_, k)| *k)
 }
 
+/// The list tabs. Zones has no list yet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Tab {
+    #[default]
+    Recent,
+    All,
+    Changed,
+    Zones,
+}
+
+impl Tab {
+    pub const ORDER: [Tab; 4] = [Tab::Recent, Tab::All, Tab::Changed, Tab::Zones];
+    /// Tabs that can be opened so far.
+    pub fn ready(self) -> bool {
+        matches!(self, Tab::Recent | Tab::Changed)
+    }
+}
+
+/// Order of the Changed tab.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortChanged {
+    #[default]
+    Alpha,
+    Recent,
+}
+
+impl SortChanged {
+    pub const ORDER: [SortChanged; 2] = [SortChanged::Alpha, SortChanged::Recent];
+    pub fn key(self) -> &'static str {
+        match self {
+            SortChanged::Alpha => "sort.alpha",
+            SortChanged::Recent => "sort.recent",
+        }
+    }
+}
+
+/// Text widths the layout needs, measured in the game's font.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Measure {
+    /// Chip labels in drawing order.
+    pub chips: Vec<f32>,
+    /// Tab labels with their counts.
+    pub tabs: [f32; 4],
+    /// Sort menu items.
+    pub sort_items: Vec<f32>,
+    /// "Reset all", "Reset", "Cancel".
+    pub buttons: [f32; 3],
+}
+
+impl Measure {
+    pub fn chips(chips: Vec<f32>) -> Self {
+        Measure { chips, ..Measure::default() }
+    }
+}
+
 /// A row's identity: a group (by group key), a sound (by sound event ID), or
 /// the "N more in this group" button under an expanded group.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -86,12 +141,16 @@ pub enum Key {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Catalog {
     pub groups: HashMap<String, Vec<String>>,
+    /// Number of sound events in the game.
+    pub total: usize,
 }
 
 impl Catalog {
     pub fn from_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Self {
         let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+        let mut total = 0;
         for id in ids {
+            total += 1;
             if let Some(g) = group_key(id) {
                 groups.entry(g).or_default().push(crate::core::normalize(id).to_owned());
             }
@@ -100,7 +159,7 @@ impl Catalog {
             v.sort();
             v.dedup();
         }
-        Catalog { groups }
+        Catalog { groups, total }
     }
 }
 
@@ -184,6 +243,14 @@ pub struct ListState {
     pub flat: bool,
     /// The sound whose "less often" drawer is open (one at a time).
     pub drawer: Option<String>,
+    pub tab: Tab,
+    /// Expanded or collapsed groups in the Changed tab (expanded by default).
+    pub open_changed: HashMap<String, bool>,
+    pub sort_changed: SortChanged,
+    /// The sort menu is open.
+    pub sort_open: bool,
+    /// "Reset all" asks for confirmation.
+    pub confirm_reset: bool,
 }
 
 impl ListState {
@@ -210,6 +277,21 @@ impl ListState {
         } else {
             self.cats.push(source);
         }
+    }
+
+    /// Expanded state of a group in the current tab, for toggling it.
+    pub fn group_open(&self, group: &str, has_playing: bool) -> bool {
+        match self.tab {
+            Tab::Changed => self.open_changed.get(group).copied().unwrap_or(true),
+            _ => self.is_open(group, has_playing),
+        }
+    }
+
+    pub fn set_group_open(&mut self, group: &str, open: bool) {
+        match self.tab {
+            Tab::Changed => self.open_changed.insert(group.to_owned(), open),
+            _ => self.open.insert(group.to_owned(), open),
+        };
     }
 
     /// Search or chips hide part of the list.
@@ -415,6 +497,129 @@ fn cooldown_row(id: &str, child: bool, settings: &Settings) -> Row {
     }
 }
 
+/// The Changed tab: groups and sounds the player set, sorted by name or by latest change.
+/// Expanded groups show every sound of the group, since the group volume reaches all of them.
+/// In the flat view, every sound quieter than normal or with a cooldown, one row each.
+/// `name` gives a row's display name for sorting.
+pub fn build_changed(
+    heard: &[HeardView],
+    settings: &Settings,
+    st: &ListState,
+    catalog: &Catalog,
+    matches: &dyn Fn(&str) -> bool,
+    name: &dyn Fn(&Key) -> String,
+) -> Vec<Row> {
+    let info = by_id(heard);
+    let unheard = |id: &str| HeardView {
+        id: id.to_owned(),
+        secs: f32::INFINITY,
+        count: 0,
+        playing: false,
+        source: usize::MAX,
+    };
+    let view = |id: &str| info.get(id).map_or_else(|| unheard(id), |h| (*h).clone());
+    // A sound's category is only known once heard; chips hide sounds of unknown category.
+    let pass = |id: &str| {
+        matches(id) && (st.cats.is_empty() || info.get(id).is_some_and(|h| st.cats.contains(&h.source)))
+    };
+    let mut ids: Vec<String> = settings.sounds.keys().chain(settings.cooldowns.keys()).cloned().collect();
+    ids.sort();
+    ids.dedup();
+    let sorted = |mut keyed: Vec<(Key, u64, Row, Vec<Row>)>| {
+        match st.sort_changed {
+            SortChanged::Alpha => keyed.sort_by_cached_key(|(k, _, _, _)| (name(k).to_lowercase(), k.clone())),
+            SortChanged::Recent => {
+                keyed.sort_by_cached_key(|(k, at, _, _)| (std::cmp::Reverse(*at), name(k).to_lowercase(), k.clone()))
+            }
+        }
+        let mut rows = Vec::new();
+        for (_, _, row, kids) in keyed {
+            rows.push(row);
+            rows.extend(kids);
+        }
+        rows
+    };
+    if st.flat {
+        let mut all: Vec<String> = ids.clone();
+        for g in settings.groups.keys() {
+            if settings.group_percent(g) < 100 {
+                all.extend(catalog.groups.get(g).into_iter().flatten().cloned());
+            }
+        }
+        all.sort();
+        all.dedup();
+        let keyed = all
+            .into_iter()
+            .filter(|id| settings.volume_percent(id) < 100 || settings.cooldowns.contains_key(id))
+            .filter(|id| pass(id))
+            .map(|id| {
+                let at = settings.sound_stamp(&id).max(group_key(&id).map_or(0, |g| settings.group_stamp(&g)));
+                (Key::Sound(id.clone()), at, sound_row(&view(&id), settings, false), Vec::new())
+            })
+            .collect();
+        return sorted(keyed);
+    }
+    let mut groups: Vec<String> = settings.groups.keys().cloned().collect();
+    let mut loose = Vec::new();
+    for id in &ids {
+        match group_key(id) {
+            Some(g) => groups.push(g),
+            None => loose.push(id.clone()),
+        }
+    }
+    groups.sort();
+    groups.dedup();
+    let mut keyed = Vec::new();
+    for g in groups {
+        let all: Vec<String> = match catalog.groups.get(&g) {
+            Some(kids) => kids.clone(),
+            None => ids.iter().filter(|id| group_key(id).as_deref() == Some(g.as_str())).cloned().collect(),
+        };
+        let changed_kids: Vec<&String> = ids.iter().filter(|id| group_key(id).as_deref() == Some(g.as_str())).collect();
+        let shown = changed_kids.iter().any(|id| pass(id))
+            || (settings.groups.contains_key(&g) && all.iter().any(|id| matches(id)) && st.cats.is_empty());
+        if !shown {
+            continue;
+        }
+        let kids: Vec<HeardView> = all
+            .iter()
+            .filter(|id| st.cats.is_empty() || info.get(id.as_str()).is_some_and(|h| st.cats.contains(&h.source)))
+            .map(|id| view(id))
+            .collect();
+        let heard_kids: Vec<&HeardView> = kids.iter().filter(|k| k.count > 0).collect();
+        let open = st.open_changed.get(&g).copied().unwrap_or(true);
+        let row = Row {
+            key: Key::Group(g.clone()),
+            child: false,
+            open,
+            playing: heard_kids.iter().any(|k| k.playing),
+            flash: heard_kids.iter().any(|k| k.secs < FLASH_SECS),
+            secs: heard_kids.iter().map(|k| k.secs).fold(f32::INFINITY, f32::min),
+            count: heard_kids.iter().map(|k| k.count).sum(),
+            heard: heard_kids.iter().map(|k| k.id.clone()).collect(),
+            volume: settings.group_percent(&g),
+            own: settings.groups.contains_key(&g),
+            inherited: false,
+            cooldown: 0,
+        };
+        let at = settings.group_stamp(&g).max(changed_kids.iter().map(|id| settings.sound_stamp(id)).max().unwrap_or(0));
+        let kid_rows = if open { kids.iter().map(|k| sound_row(k, settings, true)).collect() } else { Vec::new() };
+        keyed.push((Key::Group(g), at, row, kid_rows));
+    }
+    for id in loose.into_iter().filter(|id| pass(id)) {
+        let at = settings.sound_stamp(&id);
+        keyed.push((Key::Sound(id.clone()), at, sound_row(&view(&id), settings, false), Vec::new()));
+    }
+    let mut rows = sorted(keyed);
+    if let Some(id) = &st.drawer
+        && let Some(i) = rows.iter().position(|r| r.key == Key::Sound(id.clone()))
+    {
+        let child = rows[i].child;
+        rows.insert(i + 1, cooldown_row(id, child, settings));
+    }
+    rows
+}
+
 /// The button under an expanded group: "N more in this group", or "heard only" while all are shown.
 fn more_row(group: &str, rest: usize, showing_all: bool) -> Row {
     Row {
@@ -473,17 +678,30 @@ pub struct Layout {
     pub chips: Vec<Rect>,
     pub view_flat: Rect,
     pub view_group: Rect,
+    /// Tab labels, clickable when ready.
+    pub tab_rects: [Rect; 4],
+    /// The sort button (All and Changed).
+    pub sort: Option<Rect>,
+    /// Sort menu items while the menu is open, under the sort button.
+    pub sort_menu: Vec<Rect>,
     pub banner: Option<Rect>,
     pub list: Rect,
     pub freeze: Rect,
+    /// The Freeze button exists (Recent only).
+    pub show_freeze: bool,
+    /// Changed tab footer: where its text starts, and its buttons.
+    pub foot_text: [f32; 2],
+    pub reset_all: Option<Rect>,
+    pub confirm_yes: Option<Rect>,
+    pub confirm_no: Option<Rect>,
 }
 
 /// Height of a chip and of the view buttons.
 pub const CHIP_H: f32 = 13.0;
 
-/// `chip_text` holds the text width of each chip label, in drawing order;
-/// chips wrap onto more lines when they do not fit.
-pub fn layout(width: f32, height: f32, banner: bool, chip_text: &[f32]) -> Layout {
+/// `m` holds measured text widths; chips wrap onto more lines when they do not fit.
+pub fn layout(width: f32, height: f32, banner: bool, m: &Measure, st: &ListState) -> Layout {
+    let chip_text = m.chips.as_slice();
     let w = (width - 24.0).clamp(300.0, 640.0).min(width);
     let h = (height - 24.0).max(160.0).min(height);
     let x = ((width - w) / 2.0).floor();
@@ -493,7 +711,16 @@ pub fn layout(width: f32, height: f32, banner: bool, chip_text: &[f32]) -> Layou
     let search_clear = [search[0] + search[2] - 14.0, search[1], 14.0, 14.0];
     let tabs = [x + 6.0, y + 22.0, w - 12.0, 14.0];
     let tools_top = y + 42.0;
-    let view_group = [x + w - 6.0 - 16.0, tools_top, 16.0, CHIP_H];
+    let mut tab_rects = [[0.0; 4]; 4];
+    let mut tx = tabs[0] + 2.0;
+    for (i, tw) in m.tabs.iter().enumerate() {
+        tab_rects[i] = [tx - 3.0, tabs[1], tw + 6.0, tabs[3]];
+        tx += tw + 14.0;
+    }
+    let sorted_tab = matches!(st.tab, Tab::All | Tab::Changed);
+    let sort = sorted_tab.then(|| [x + w - 6.0 - 16.0, tools_top, 16.0, CHIP_H]);
+    let right = sort.map_or(x + w - 6.0, |s| s[0] - 4.0);
+    let view_group = [right - 16.0, tools_top, 16.0, CHIP_H];
     let view_flat = [view_group[0] - 16.0, tools_top, 16.0, CHIP_H];
     let chips_right = view_flat[0] - 8.0;
     let mut chips = Vec::with_capacity(chip_text.len());
@@ -514,6 +741,19 @@ pub fn layout(width: f32, height: f32, banner: bool, chip_text: &[f32]) -> Layou
         r
     });
     let freeze = [x + w - 92.0, y + h - 22.0, 86.0, 18.0];
+    let mut sort_menu = Vec::new();
+    if let (Some(s), true) = (sort, st.sort_open) {
+        let mw = m.sort_items.iter().copied().fold(80.0, f32::max) + 16.0;
+        for i in 0..m.sort_items.len() {
+            sort_menu.push([s[0] + s[2] - mw, s[1] + s[3] + 3.0 + i as f32 * 14.0, mw, 14.0]);
+        }
+    }
+    let foot_y = y + h - 22.0;
+    let changed = st.tab == Tab::Changed;
+    let [reset_w, yes_w, no_w] = m.buttons.map(|b| b + 16.0);
+    let reset_all = (changed && !st.confirm_reset).then(|| [x + w - 6.0 - reset_w, foot_y, reset_w, 18.0]);
+    let confirm_no = (changed && st.confirm_reset).then(|| [x + w - 6.0 - no_w, foot_y, no_w, 18.0]);
+    let confirm_yes = confirm_no.map(|n| [n[0] - 4.0 - yes_w, foot_y, yes_w, 18.0]);
     Layout {
         panel: [x, y, w, h],
         title: [x + 8.0, y + 7.0],
@@ -524,9 +764,17 @@ pub fn layout(width: f32, height: f32, banner: bool, chip_text: &[f32]) -> Layou
         chips,
         view_flat,
         view_group,
+        tab_rects,
+        sort,
+        sort_menu,
         banner,
         list: [x + 6.0, top, w - 12.0, (y + h - 26.0 - top).max(0.0)],
         freeze,
+        show_freeze: st.tab == Tab::Recent,
+        foot_text: [x + 8.0, foot_y + 5.0],
+        reset_all,
+        confirm_yes,
+        confirm_no,
     }
 }
 
@@ -612,6 +860,14 @@ pub enum Hit {
     Chip(usize),
     ViewFlat,
     ViewGroup,
+    Tab(usize),
+    Sort,
+    SortItem(usize),
+    /// A click outside the open sort menu: it only closes the menu.
+    SortClose,
+    ResetAll,
+    ConfirmYes,
+    ConfirmNo,
     /// A sound row's timer: open or close its drawer.
     Timer(usize),
     /// A drawer's slider, with the cooldown step under the pointer.
@@ -628,8 +884,29 @@ pub enum Hit {
 }
 
 pub fn hit(lay: &Layout, rows: &[Row], scroll: f32, p: [f32; 2]) -> Hit {
+    if let Some(i) = lay.sort_menu.iter().position(|r| contains(*r, p)) {
+        return Hit::SortItem(i);
+    }
+    if lay.sort.is_some_and(|s| contains(s, p)) {
+        return Hit::Sort;
+    }
+    if !lay.sort_menu.is_empty() {
+        return Hit::SortClose;
+    }
     if contains(lay.close, p) {
         return Hit::Close;
+    }
+    if let Some(i) = lay.tab_rects.iter().position(|r| contains(*r, p)) {
+        return Hit::Tab(i);
+    }
+    if lay.reset_all.is_some_and(|r| contains(r, p)) {
+        return Hit::ResetAll;
+    }
+    if lay.confirm_yes.is_some_and(|r| contains(r, p)) {
+        return Hit::ConfirmYes;
+    }
+    if lay.confirm_no.is_some_and(|r| contains(r, p)) {
+        return Hit::ConfirmNo;
     }
     if contains(lay.search_clear, p) {
         return Hit::SearchClear;
@@ -646,7 +923,7 @@ pub fn hit(lay: &Layout, rows: &[Row], scroll: f32, p: [f32; 2]) -> Hit {
     if contains(lay.view_group, p) {
         return Hit::ViewGroup;
     }
-    if contains(lay.freeze, p) {
+    if lay.show_freeze && contains(lay.freeze, p) {
         return Hit::Freeze;
     }
     if lay.banner.is_some_and(|b| contains(b, p)) {
@@ -888,7 +1165,7 @@ mod tests {
     #[test]
     fn layout_parts_do_not_overlap() {
         for (w, h) in [(427.0, 240.0), (640.0, 360.0), (960.0, 540.0)] {
-            let lay = layout(w, h, true, &[]);
+            let lay = layout(w, h, true, &Measure::default(), &ListState::default());
             assert!(lay.panel[0] >= 0.0 && lay.panel[0] + lay.panel[2] <= w);
             let b = lay.banner.unwrap();
             assert!(b[1] + b[3] <= lay.list[1]);
@@ -912,7 +1189,7 @@ mod tests {
         let heard = [h("entity.chicken.ambient", 1.0, false), h("entity.chicken.egg", 2.0, false)];
         let s = Settings::parse("sound entity.chicken.egg 50\n");
         let (rows, _) = build(&heard, &s, &ListState::default(), &Catalog::default(), &|_| true);
-        let lay = layout(640.0, 360.0, false, &[]);
+        let lay = layout(640.0, 360.0, false, &Measure::default(), &ListState::default());
         let vis = visible(rows.len(), lay.list, 0.0);
         let mid = |r: Rect| [r[0] + r[2] / 2.0, r[1] + r[3] / 2.0];
         let c1 = columns(vis[1].1, true);
@@ -1042,10 +1319,10 @@ mod tests {
 
     #[test]
     fn chips_wrap_when_the_row_is_full() {
-        let lay = layout(640.0, 360.0, false, &[40.0; 9]);
+        let lay = layout(640.0, 360.0, false, &Measure::chips(vec![40.0; 9]), &ListState::default());
         assert_eq!(lay.chips.len(), 9);
         assert!(lay.chips.iter().all(|c| c[0] + c[2] <= lay.view_flat[0]));
-        let narrow = layout(320.0, 360.0, false, &[40.0; 9]);
+        let narrow = layout(320.0, 360.0, false, &Measure::chips(vec![40.0; 9]), &ListState::default());
         assert!(narrow.chips[8][1] > narrow.chips[0][1]);
         assert!(narrow.list[1] > lay.list[1]);
         assert_eq!(hit(&lay, &[], 0.0, [lay.chips[2][0] + 1.0, lay.chips[2][1] + 1.0]), Hit::Chip(2));
@@ -1059,7 +1336,7 @@ mod tests {
         let (rows, _) = build(&heard, &s, &st, &Catalog::default(), &|_| true);
         assert_eq!(keys(&rows), ["G:entity.cow", "  entity.cow.ambient", "  entity.cow.step", "K:entity.cow.step"]);
         assert_eq!((rows[2].cooldown, rows[3].cooldown), (30, 30));
-        let lay = layout(640.0, 360.0, false, &[]);
+        let lay = layout(640.0, 360.0, false, &Measure::default(), &ListState::default());
         let vis = visible(rows.len(), lay.list, 0.0);
         let mid = |r: Rect| [r[0] + r[2] / 2.0, r[1] + r[3] / 2.0];
         let c = columns(vis[3].1, true);
@@ -1081,6 +1358,56 @@ mod tests {
         assert_eq!(cooldown_text(0, "en_us"), "default");
         assert_eq!(cooldown_text(45, "en_us"), "45 s cooldown");
         assert!(rate_text(90, "ru_ru").contains("1,5"));
+    }
+
+    #[test]
+    fn changed_tab_lists_set_groups_with_all_their_sounds_and_sorts() {
+        let s = Settings::parse("group entity.cow 40 100\nsound entity.chicken.egg 0 300\ncooldown ui.toast.in 10 200\n");
+        let catalog = Catalog::from_ids(["entity.cow.ambient", "entity.cow.step", "entity.chicken.egg", "entity.chicken.ambient"]);
+        let heard = [h("entity.cow.step", 3.0, false)];
+        let st = ListState { tab: Tab::Changed, ..ListState::default() };
+        let name = |k: &Key| match k {
+            Key::Group(g) | Key::Sound(g) | Key::More(g) | Key::Cooldown(g) => g.clone(),
+        };
+        let rows = build_changed(&heard, &s, &st, &catalog, &|_| true, &name);
+        assert_eq!(
+            keys(&rows),
+            ["G:entity.chicken", "  entity.chicken.ambient", "  entity.chicken.egg", "G:entity.cow", "  entity.cow.ambient", "  entity.cow.step", "G:ui", "  ui.toast.in"]
+        );
+        assert!(rows[3].own && rows[4].inherited);
+        assert_eq!(rows[5].count, 1);
+        let recent = ListState { sort_changed: SortChanged::Recent, ..st.clone() };
+        let rows = build_changed(&heard, &s, &recent, &catalog, &|_| true, &name);
+        assert_eq!(rows[0].key, Key::Group("entity.chicken".into()));
+        assert_eq!(rows[rows.len() - 3].key, Key::Group("entity.cow".into()));
+        let flat = ListState { flat: true, ..st.clone() };
+        let rows = build_changed(&heard, &s, &flat, &catalog, &|_| true, &name);
+        assert_eq!(keys(&rows), ["S:entity.chicken.egg", "S:entity.cow.ambient", "S:entity.cow.step", "S:ui.toast.in"]);
+    }
+
+    #[test]
+    fn tabs_sort_menu_and_footer_are_hit() {
+        let m = Measure { tabs: [40.0; 4], sort_items: vec![50.0, 60.0], buttons: [50.0, 40.0, 40.0], ..Measure::default() };
+        let mid = |r: Rect| [r[0] + r[2] / 2.0, r[1] + r[3] / 2.0];
+        let recent = layout(640.0, 360.0, false, &m, &ListState::default());
+        assert!(recent.sort.is_none() && recent.reset_all.is_none() && recent.show_freeze);
+        assert_eq!(hit(&recent, &[], 0.0, mid(recent.tab_rects[2])), Hit::Tab(2));
+        let mut st = ListState { tab: Tab::Changed, ..ListState::default() };
+        let lay = layout(640.0, 360.0, false, &m, &st);
+        assert!(!lay.show_freeze);
+        assert_eq!(hit(&lay, &[], 0.0, mid(lay.sort.unwrap())), Hit::Sort);
+        assert_eq!(hit(&lay, &[], 0.0, mid(lay.reset_all.unwrap())), Hit::ResetAll);
+        assert!(lay.view_group[0] + lay.view_group[2] <= lay.sort.unwrap()[0]);
+        st.sort_open = true;
+        let lay = layout(640.0, 360.0, false, &m, &st);
+        assert_eq!(lay.sort_menu.len(), 2);
+        assert_eq!(hit(&lay, &[], 0.0, mid(lay.sort_menu[1])), Hit::SortItem(1));
+        assert_eq!(hit(&lay, &[], 0.0, mid(lay.close)), Hit::SortClose);
+        st.sort_open = false;
+        st.confirm_reset = true;
+        let lay = layout(640.0, 360.0, false, &m, &st);
+        assert_eq!(hit(&lay, &[], 0.0, mid(lay.confirm_yes.unwrap())), Hit::ConfirmYes);
+        assert_eq!(hit(&lay, &[], 0.0, mid(lay.confirm_no.unwrap())), Hit::ConfirmNo);
     }
 
     #[test]
