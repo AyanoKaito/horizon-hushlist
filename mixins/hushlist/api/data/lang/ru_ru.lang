@@ -12,6 +12,7 @@ banner.hint=нажмите, чтобы показать
 empty.title=Пока тихо
 empty.text=Звуки появятся здесь, как только вы их услышите.
 group.heard_count=Слышали: {n}
+group.sounds=Звуков: {n}
 group.heard_list=Слышали: {list}
 group.more=Ещё в группе: {n}
 group.hide_unheard=Скрыть неуслышанные
@@ -30,6 +31,8 @@ group.from=из группы “{name}”
 # Changed tab
 sort.alpha=По алфавиту
 sort.recent=Недавно изменённые
+sort.category=По категории
+sort.size=Сначала большие группы
 changed.count=Изменено: {n}
 changed.none=Вы ещё ничего не меняли
 changed.reset_all=Сбросить всё

@@ -5,7 +5,7 @@ mod i18n;
 mod ui;
 
 use crate::core::{Engine, MOD_ID, MOD_VERSION, SETTINGS_FILE, Settings, group_key, normalize, nudged};
-use crate::ui::{Hit, HeardView, Key, ListState, Rect, Row, SortChanged, Tab, approach, fade, mix};
+use crate::ui::{Hit, HeardView, Key, ListState, Rect, Row, SortAll, SortChanged, Tab, approach, fade, mix};
 use horizon_client::lang;
 use horizon_client::mod_api::{
     ClientTickPostEvent, Flow, Hooks, Host, HudBatch, KeyEvent, ModsEvent, NativeMod,
@@ -141,8 +141,18 @@ struct State {
     badges: Vec<(Rect, String)>,
     /// Tab counts: heard recently, sounds in the game, settings.
     counts: [usize; 3],
+    /// Display names and lowercase search text by row key, for the current language.
+    /// The All tab sorts and searches about 2000 sounds; this keeps each frame cheap.
+    texts: std::cell::RefCell<Texts>,
     /// When the live order was last refreshed.
     live_at: Option<Instant>,
+}
+
+#[derive(Default)]
+struct Texts {
+    lang: String,
+    /// Key id (`g:` group, `s:` sound) to (display name, lowercase name + ID + group name).
+    by_key: std::collections::HashMap<String, (String, String)>,
 }
 
 /// Animation state between frames. Positions and alphas ease toward their targets.
@@ -276,13 +286,10 @@ impl State {
     fn rows(&mut self, now: Instant) -> (Vec<HeardView>, Vec<Row>, usize) {
         let views = self.views(now);
         self.counts = [views.len(), self.catalog.total, self.engine.settings.count()];
-        if self.list.tab == Tab::Changed {
-            let name = |k: &Key| match k {
-                Key::Group(g) => group_name(g),
-                Key::Sound(s) => sound_name(&self.subtitles, s),
-                Key::More(_) | Key::Cooldown(_) => String::new(),
-            };
-            let rows = ui::build_changed(&views, &self.engine.settings, &self.list, &self.catalog, &self.matcher(), &name);
+        if matches!(self.list.tab, Tab::Changed | Tab::All) {
+            let name = |k: &Key| self.text_of(k).0;
+            let build = if self.list.tab == Tab::All { ui::build_all } else { ui::build_changed };
+            let rows = build(&views, &self.engine.settings, &self.list, &self.catalog, &self.matcher(), &name);
             return (views, rows, 0);
         }
         // The live order waits while a slider is held, so the row does not move under the pointer.
@@ -312,6 +319,40 @@ impl State {
         (views, rows, fresh)
     }
 
+    /// A row's display name and search text, cached per language.
+    fn text_of(&self, key: &Key) -> (String, String) {
+        let mut texts = self.texts.borrow_mut();
+        let code = lang::code();
+        if texts.lang != code {
+            texts.by_key.clear();
+            texts.lang = code;
+        }
+        let id = match key {
+            Key::Group(g) => format!("g:{g}"),
+            Key::Sound(s) => format!("s:{s}"),
+            Key::More(_) | Key::Cooldown(_) => return Default::default(),
+        };
+        if let Some(hit) = texts.by_key.get(&id) {
+            return hit.clone();
+        }
+        let entry = match key {
+            Key::Group(g) => {
+                let name = group_name(g);
+                let hay = format!("{name} {g}").to_lowercase();
+                (name, hay)
+            }
+            Key::Sound(s) => {
+                let name = sound_name(&self.subtitles, s);
+                let group = group_key(s).map(|g| group_name(&g)).unwrap_or_default();
+                let hay = format!("{name} {} {group}", normalize(s)).to_lowercase();
+                (name, hay)
+            }
+            Key::More(_) | Key::Cooldown(_) => unreachable!(),
+        };
+        texts.by_key.insert(id, entry.clone());
+        entry
+    }
+
     /// Whether a sound fits the search text: its name, ID, group name or category, any case.
     fn matcher(&self) -> impl Fn(&str) -> bool + '_ {
         let query = self.list.query.trim().to_lowercase();
@@ -320,18 +361,12 @@ impl State {
             if query.is_empty() {
                 return true;
             }
-            let mut hay = sound_name(&self.subtitles, id);
-            hay.push(' ');
-            hay.push_str(normalize(id));
-            if let Some(g) = group_key(id) {
-                hay.push(' ');
-                hay.push_str(&group_name(&g));
+            let (_, hay) = self.text_of(&Key::Sound(normalize(id).to_owned()));
+            if hay.contains(&query) {
+                return true;
             }
-            if let Some(cat) = self.engine.recent.get(normalize(id)).and_then(|h| ui::category_key(h.source)) {
-                hay.push(' ');
-                hay.push_str(i18n::text(&code, cat));
-            }
-            hay.to_lowercase().contains(&query)
+            let source = self.engine.recent.get(normalize(id)).map_or_else(|| ui::guess_source(id), |h| h.source);
+            ui::category_key(source).is_some_and(|cat| i18n::text(&code, cat).to_lowercase().contains(&query))
         }
     }
 
@@ -358,7 +393,7 @@ impl State {
         let m = ui::Measure {
             chips,
             tabs,
-            sort_items: SortChanged::ORDER.iter().map(|s| w(s.key())).collect(),
+            sort_items: sort_keys(self.list.tab).iter().map(|k| w(k)).collect(),
             buttons: [w("changed.reset_all"), w("button.reset"), w("button.cancel")],
         };
         let banner = self.list.tab == Tab::Recent && self.list.frozen && fresh > 0;
@@ -654,7 +689,10 @@ impl Hooks for Hushlist {
             }
             Hit::Sort => st.list.sort_open = !st.list.sort_open,
             Hit::SortItem(i) => {
-                st.list.sort_changed = SortChanged::ORDER[i];
+                match st.list.tab {
+                    Tab::All => st.list.sort_all = SortAll::ORDER[i],
+                    _ => st.list.sort_changed = SortChanged::ORDER[i],
+                }
                 st.list.sort_open = false;
             }
             Hit::SortClose => {}
@@ -948,6 +986,15 @@ fn dump_rows(st: &mut State, rows: &[Row], lay: &ui::Layout, now: Instant) {
     let _ = std::fs::write(path, format!("{{\"layout\":{layout},\"rows\":[{}]}}", items.join(",")));
 }
 
+/// Sort menu items of a tab.
+fn sort_keys(tab: Tab) -> Vec<&'static str> {
+    match tab {
+        Tab::All => SortAll::ORDER.iter().map(|s| s.key()).collect(),
+        Tab::Changed => SortChanged::ORDER.iter().map(|s| s.key()).collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn unix_now() -> u64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
@@ -1036,13 +1083,17 @@ fn draw_sort_menu(st: &State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
     let panel = [first[0] - 3.0, first[1] - 3.0, first[2] + 6.0, last[1] + last[3] - first[1] + 6.0];
     rrect(host, b, [panel[0] - 1.0, panel[1] - 1.0, panel[2] + 2.0, panel[3] + 2.0], 5.0, 0x30_FF_FF_FF);
     rrect(host, b, panel, 4.0, MENU);
-    for (r, item) in lay.sort_menu.iter().zip(SortChanged::ORDER) {
-        let on = item == st.list.sort_changed;
+    let selected = match st.list.tab {
+        Tab::All => SortAll::ORDER.iter().position(|s| *s == st.list.sort_all),
+        _ => SortChanged::ORDER.iter().position(|s| *s == st.list.sort_changed),
+    };
+    for (i, (r, key)) in lay.sort_menu.iter().zip(sort_keys(st.list.tab)).enumerate() {
+        let on = selected == Some(i);
         let hover = ui::contains(*r, mouse);
         if on || hover {
             rrect(host, b, *r, 3.0, if on { 0x24_FF_FF_FF } else { 0x14_FF_FF_FF });
         }
-        host.text(b, tr(item.key()), [r[0] + 9.0, r[1] + 4.0], if on || hover { TEXT } else { DIM }, false);
+        host.text(b, tr(key), [r[0] + 9.0, r[1] + 4.0], if on || hover { TEXT } else { DIM }, false);
     }
 }
 
@@ -1313,7 +1364,10 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
             Key::Group(g) => {
                 let chevron = if row.open { Icon::ChevronDown } else { Icon::ChevronRight };
                 icon(host, b, chevron, Tone::Dim, c.ind);
-                let detail = if row.open {
+                let detail = if st.list.tab == Tab::All {
+                    // The All tab is about the game's sounds, not what was heard.
+                    i18n::with_n(&code, "group.sounds", st.catalog.groups.get(g).map_or(0, Vec::len))
+                } else if row.open {
                     i18n::with_n(&code, "group.heard_count", row.heard.len())
                 } else {
                     let names: Vec<String> = row.heard.iter().map(|id| sound_name(&st.subtitles, id)).collect();

@@ -70,6 +70,40 @@ pub fn cooldown_text(secs: u32, lang: &str) -> String {
     text(lang, "cooldown.badge").replace("{time}", &rate_text(secs, lang))
 }
 
+/// Mobs counted as hostile when guessing a category.
+const HOSTILE: [&str; 42] = [
+    "zombie", "husk", "drowned", "skeleton", "stray", "bogged", "wither_skeleton", "creeper", "spider", "cave_spider",
+    "enderman", "endermite", "silverfish", "slime", "magma_cube", "ghast", "blaze", "witch", "vindicator", "evoker",
+    "illusioner", "pillager", "ravager", "vex", "guardian", "elder_guardian", "shulker", "phantom", "piglin",
+    "piglin_brute", "zombified_piglin", "hoglin", "zoglin", "warden", "breeze", "creaking", "wither", "ender_dragon",
+    "zombie_villager", "parched", "zombie_nautilus", "camel_husk",
+];
+/// Entity sounds that belong to the player's own actions.
+const PLAYER_ENTITIES: [&str; 13] = [
+    "player", "generic", "experience_orb", "item", "arrow", "fishing_bobber", "ender_pearl", "snowball", "egg",
+    "experience_bottle", "splash_potion", "lingering_potion", "wind_charge",
+];
+
+/// The category a sound most likely plays in, from its ID. The game picks the category
+/// at each play, so this is a guess for sounds not heard yet; a heard sound's real one wins.
+pub fn guess_source(id: &str) -> usize {
+    let mut p = crate::core::normalize(id).split('.');
+    let (a, b) = (p.next().unwrap_or(""), p.next().unwrap_or(""));
+    match a {
+        "music" => 1,
+        "music_disc" => 2,
+        "weather" => 3,
+        "ui" => 10,
+        "block" if b == "note_block" => 2,
+        "block" => 4,
+        "item" | "enchant" => 7,
+        "entity" if PLAYER_ENTITIES.contains(&b) => 7,
+        "entity" if HOSTILE.contains(&b) => 5,
+        "entity" => 6,
+        _ => 8,
+    }
+}
+
 /// The chip's translation key for a sound source index.
 pub fn category_key(source: usize) -> Option<&'static str> {
     CATEGORIES.iter().find(|(s, _)| *s == source).map(|(_, k)| *k)
@@ -89,7 +123,27 @@ impl Tab {
     pub const ORDER: [Tab; 4] = [Tab::Recent, Tab::All, Tab::Changed, Tab::Zones];
     /// Tabs that can be opened so far.
     pub fn ready(self) -> bool {
-        matches!(self, Tab::Recent | Tab::Changed)
+        matches!(self, Tab::Recent | Tab::All | Tab::Changed)
+    }
+}
+
+/// Order of the All tab.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortAll {
+    #[default]
+    Alpha,
+    Category,
+    Size,
+}
+
+impl SortAll {
+    pub const ORDER: [SortAll; 3] = [SortAll::Alpha, SortAll::Category, SortAll::Size];
+    pub fn key(self) -> &'static str {
+        match self {
+            SortAll::Alpha => "sort.alpha",
+            SortAll::Category => "sort.category",
+            SortAll::Size => "sort.size",
+        }
     }
 }
 
@@ -145,6 +199,8 @@ pub enum Key {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Catalog {
     pub groups: HashMap<String, Vec<String>>,
+    /// Sounds without a group, sorted.
+    pub loose: Vec<String>,
     /// Number of sound events in the game.
     pub total: usize,
 }
@@ -153,17 +209,21 @@ impl Catalog {
     pub fn from_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Self {
         let mut groups: HashMap<String, Vec<String>> = HashMap::new();
         let mut total = 0;
+        let mut loose = Vec::new();
         for id in ids {
             total += 1;
-            if let Some(g) = group_key(id) {
-                groups.entry(g).or_default().push(crate::core::normalize(id).to_owned());
+            match group_key(id) {
+                Some(g) => groups.entry(g).or_default().push(crate::core::normalize(id).to_owned()),
+                None => loose.push(crate::core::normalize(id).to_owned()),
             }
         }
+        loose.sort();
+        loose.dedup();
         for v in groups.values_mut() {
             v.sort();
             v.dedup();
         }
-        Catalog { groups, total }
+        Catalog { groups, loose, total }
     }
 }
 
@@ -251,6 +311,9 @@ pub struct ListState {
     /// Expanded or collapsed groups in the Changed tab (expanded by default).
     pub open_changed: HashMap<String, bool>,
     pub sort_changed: SortChanged,
+    pub sort_all: SortAll,
+    /// Expanded groups in the All tab (collapsed by default).
+    pub open_all: HashMap<String, bool>,
     /// The sort menu is open.
     pub sort_open: bool,
     /// "Reset all" asks for confirmation.
@@ -287,6 +350,7 @@ impl ListState {
     pub fn group_open(&self, group: &str, has_playing: bool) -> bool {
         match self.tab {
             Tab::Changed => self.open_changed.get(group).copied().unwrap_or(true),
+            Tab::All => self.open_all.get(group).copied().unwrap_or(false),
             _ => self.is_open(group, has_playing),
         }
     }
@@ -294,6 +358,7 @@ impl ListState {
     pub fn set_group_open(&mut self, group: &str, open: bool) {
         match self.tab {
             Tab::Changed => self.open_changed.insert(group.to_owned(), open),
+            Tab::All => self.open_all.insert(group.to_owned(), open),
             _ => self.open.insert(group.to_owned(), open),
         };
     }
@@ -444,10 +509,14 @@ pub fn build(
                 if open {
                     rows.extend(kids.iter().map(|k| sound_row(k, settings, true)));
                     let all = catalog.groups.get(g).map(Vec::as_slice).unwrap_or(&[]);
-                    // Unheard sounds have no category yet, so chips hide them; the search still applies.
+                    // Unheard sounds use their guessed category.
                     let rest: Vec<&String> = all
                         .iter()
-                        .filter(|id| st.cats.is_empty() && !e.kids.contains(id) && matches(id))
+                        .filter(|id| {
+                            !e.kids.contains(id)
+                                && matches(id)
+                                && (st.cats.is_empty() || st.cats.contains(&guess_source(id)))
+                        })
                         .collect();
                     let show_all = st.show_all.contains(g);
                     if show_all {
@@ -522,10 +591,8 @@ pub fn build_changed(
         source: usize::MAX,
     };
     let view = |id: &str| info.get(id).map_or_else(|| unheard(id), |h| (*h).clone());
-    // A sound's category is only known once heard; chips hide sounds of unknown category.
-    let pass = |id: &str| {
-        matches(id) && (st.cats.is_empty() || info.get(id).is_some_and(|h| st.cats.contains(&h.source)))
-    };
+    let source = |id: &str| info.get(id).map_or_else(|| guess_source(id), |h| h.source);
+    let pass = |id: &str| matches(id) && (st.cats.is_empty() || st.cats.contains(&source(id)));
     let mut ids: Vec<String> = settings.sounds.keys().chain(settings.cooldowns.keys()).cloned().collect();
     ids.sort();
     ids.dedup();
@@ -581,13 +648,13 @@ pub fn build_changed(
         };
         let changed_kids: Vec<&String> = ids.iter().filter(|id| group_key(id).as_deref() == Some(g.as_str())).collect();
         let shown = changed_kids.iter().any(|id| pass(id))
-            || (settings.groups.contains_key(&g) && all.iter().any(|id| matches(id)) && st.cats.is_empty());
+            || (settings.groups.contains_key(&g) && all.iter().any(|id| pass(id)));
         if !shown {
             continue;
         }
         let kids: Vec<HeardView> = all
             .iter()
-            .filter(|id| st.cats.is_empty() || info.get(id.as_str()).is_some_and(|h| st.cats.contains(&h.source)))
+            .filter(|id| st.cats.is_empty() || st.cats.contains(&source(id)))
             .map(|id| view(id))
             .collect();
         let heard_kids: Vec<&HeardView> = kids.iter().filter(|k| k.count > 0).collect();
@@ -615,6 +682,86 @@ pub fn build_changed(
         keyed.push((Key::Sound(id.clone()), at, sound_row(&view(&id), settings, false), Vec::new()));
     }
     let mut rows = sorted(keyed);
+    if let Some(id) = &st.drawer
+        && let Some(i) = rows.iter().position(|r| r.key == Key::Sound(id.clone()))
+    {
+        let child = rows[i].child;
+        rows.insert(i + 1, cooldown_row(id, child, settings));
+    }
+    rows
+}
+
+/// The All tab: every sound of the game, groups collapsed by default, sorted by name,
+/// category or group size. Search and chips narrow it like the other tabs.
+pub fn build_all(
+    heard: &[HeardView],
+    settings: &Settings,
+    st: &ListState,
+    catalog: &Catalog,
+    matches: &dyn Fn(&str) -> bool,
+    name: &dyn Fn(&Key) -> String,
+) -> Vec<Row> {
+    let info = by_id(heard);
+    let source = |id: &str| info.get(id).map_or_else(|| guess_source(id), |h| h.source);
+    let pass = |id: &str| matches(id) && (st.cats.is_empty() || st.cats.contains(&source(id)));
+    let view = |id: &str| {
+        info.get(id).map_or_else(
+            || HeardView { id: id.to_owned(), secs: f32::INFINITY, count: 0, playing: false, source: guess_source(id) },
+            |h| (*h).clone(),
+        )
+    };
+    let cat_rank = |s: usize| CATEGORIES.iter().position(|(c, _)| *c == s).unwrap_or(CATEGORIES.len());
+    // (key, category rank, size, row, kids)
+    let mut keyed: Vec<(Key, usize, usize, Row, Vec<Row>)> = Vec::new();
+    if st.flat {
+        let mut ids: Vec<&String> = catalog.groups.values().flatten().chain(catalog.loose.iter()).collect();
+        ids.sort();
+        for id in ids.into_iter().filter(|id| pass(id)) {
+            keyed.push((Key::Sound(id.clone()), cat_rank(source(id)), 1, sound_row(&view(id), settings, false), Vec::new()));
+        }
+    } else {
+        for (g, all) in &catalog.groups {
+            let kids: Vec<&String> = all.iter().filter(|id| pass(id)).collect();
+            if kids.is_empty() {
+                continue;
+            }
+            let views: Vec<HeardView> = kids.iter().map(|id| view(id)).collect();
+            let heard_kids: Vec<&HeardView> = views.iter().filter(|k| k.count > 0).collect();
+            let open = st.open_all.get(g).copied().unwrap_or(false);
+            let row = Row {
+                key: Key::Group(g.clone()),
+                child: false,
+                open,
+                playing: heard_kids.iter().any(|k| k.playing),
+                flash: heard_kids.iter().any(|k| k.secs < FLASH_SECS),
+                secs: heard_kids.iter().map(|k| k.secs).fold(f32::INFINITY, f32::min),
+                count: heard_kids.iter().map(|k| k.count).sum(),
+                heard: heard_kids.iter().map(|k| k.id.clone()).collect(),
+                volume: settings.group_percent(g),
+                own: settings.groups.contains_key(g),
+                inherited: false,
+                cooldown: 0,
+            };
+            let rank = cat_rank(source(&all[0]));
+            let kid_rows = if open { views.iter().map(|k| sound_row(k, settings, true)).collect() } else { Vec::new() };
+            keyed.push((Key::Group(g.clone()), rank, all.len(), row, kid_rows));
+        }
+        for id in catalog.loose.iter().filter(|id| pass(id)) {
+            keyed.push((Key::Sound(id.clone()), cat_rank(source(id)), 1, sound_row(&view(id), settings, false), Vec::new()));
+        }
+    }
+    match st.sort_all {
+        SortAll::Alpha => keyed.sort_by_cached_key(|(k, _, _, _, _)| (name(k).to_lowercase(), k.clone())),
+        SortAll::Category => keyed.sort_by_cached_key(|(k, c, _, _, _)| (*c, name(k).to_lowercase(), k.clone())),
+        SortAll::Size => {
+            keyed.sort_by_cached_key(|(k, _, n, _, _)| (std::cmp::Reverse(*n), name(k).to_lowercase(), k.clone()))
+        }
+    }
+    let mut rows = Vec::new();
+    for (_, _, _, row, kids) in keyed {
+        rows.push(row);
+        rows.extend(kids);
+    }
     if let Some(id) = &st.drawer
         && let Some(i) = rows.iter().position(|r| r.key == Key::Sound(id.clone()))
     {
@@ -1415,6 +1562,43 @@ mod tests {
         let lay = layout(640.0, 360.0, false, &m, &st);
         assert_eq!(hit(&lay, &[], 0.0, mid(lay.confirm_yes.unwrap())), Hit::ConfirmYes);
         assert_eq!(hit(&lay, &[], 0.0, mid(lay.confirm_no.unwrap())), Hit::ConfirmNo);
+    }
+
+    #[test]
+    fn all_tab_lists_every_sound_collapsed_and_sorts() {
+        let catalog = Catalog::from_ids([
+            "entity.cow.ambient", "entity.cow.step", "entity.zombie.ambient", "block.stone.break", "block.stone.step",
+            "block.stone.hit", "ambient.cave",
+        ]);
+        assert_eq!(catalog.total, 7);
+        let st = ListState { tab: Tab::All, ..ListState::default() };
+        let name = |k: &Key| match k {
+            Key::Group(g) | Key::Sound(g) | Key::More(g) | Key::Cooldown(g) => g.clone(),
+        };
+        let rows = build_all(&[], &Settings::default(), &st, &catalog, &|_| true, &name);
+        assert_eq!(keys(&rows), ["G:ambient", "G:block.stone", "G:entity.cow", "G:entity.zombie"]);
+        let mut open = st.clone();
+        open.open_all.insert("entity.cow".into(), true);
+        open.sort_all = SortAll::Size;
+        let rows = build_all(&[], &Settings::default(), &open, &catalog, &|_| true, &name);
+        assert_eq!(keys(&rows)[..4], ["G:block.stone", "G:entity.cow", "  entity.cow.ambient", "  entity.cow.step"]);
+        let mut hostile = st.clone();
+        hostile.cats = vec![5];
+        let rows = build_all(&[], &Settings::default(), &hostile, &catalog, &|_| true, &name);
+        assert_eq!(keys(&rows), ["G:entity.zombie"]);
+        let by_cat = ListState { sort_all: SortAll::Category, ..st.clone() };
+        let rows = build_all(&[], &Settings::default(), &by_cat, &catalog, &|_| true, &name);
+        assert_eq!(keys(&rows), ["G:block.stone", "G:entity.cow", "G:entity.zombie", "G:ambient"]);
+    }
+
+    #[test]
+    fn guessed_categories() {
+        assert_eq!(guess_source("minecraft:entity.zombie.ambient"), 5);
+        assert_eq!(guess_source("entity.cow.ambient"), 6);
+        assert_eq!(guess_source("entity.player.hurt"), 7);
+        assert_eq!(guess_source("block.note_block.harp"), 2);
+        assert_eq!(guess_source("music_disc.cat"), 2);
+        assert_eq!(guess_source("ambient.cave"), 8);
     }
 
     #[test]

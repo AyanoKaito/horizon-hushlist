@@ -12,6 +12,7 @@ banner.hint=click to show
 empty.title=All quiet
 empty.text=Sounds appear here as soon as you hear them.
 group.heard_count=Heard: {n}
+group.sounds=Sounds: {n}
 group.heard_list=Heard: {list}
 group.more={n} more in this group
 group.hide_unheard=Hide unheard
@@ -30,6 +31,8 @@ group.from=from group “{name}”
 # Changed tab
 sort.alpha=A to Z
 sort.recent=Recently changed
+sort.category=By category
+sort.size=Largest groups first
 changed.count=Changed: {n}
 changed.none=Nothing changed yet
 changed.reset_all=Reset all
