@@ -42,11 +42,11 @@ The player wants to see what they have changed. A "Changed" view shows only adju
 - Volume 0–100%, mute, reset.
 - Highlight a row while its sound is playing.
 - Settings saved between sessions.
+- Profiles: named sets of settings, one active at a time.
 
 ## Not in the first version
 
 - Making sounds louder than normal.
 - Settings tied to places in the world.
-- Profiles.
 - Spatial visualisation of where sounds come from.
 - A real audio level meter.

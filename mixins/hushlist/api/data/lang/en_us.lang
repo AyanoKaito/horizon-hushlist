@@ -151,4 +151,25 @@ group.entity.boat=Boat
 mod.description=Turn down individual sounds: a live list of what you hear, with a volume for each sound and each group.
 key.open=Hotkey to open
 page.reset=Reset all sound settings...
-page.reset_yes=Yes, reset all sound settings
+page.reset_yes=Yes, reset in every profile
+
+# Profiles
+profile.button=Profile: {name}
+profile.default=Default
+profiles.title=Profiles
+profiles.back=Back
+profiles.hint=Sound changes are saved to the active profile.
+profiles.used=Using profile “{name}”
+profiles.active=Active
+profiles.meta=changed: {n}
+profiles.active_no_delete=You can’t delete the active profile. Use another one first.
+profiles.new=New profile
+profiles.use=Use
+profiles.rename=Rename
+profiles.duplicate=Duplicate
+profiles.delete=Delete...
+profiles.delete_yes=Delete
+profiles.delete_q=Delete profile “{name}”? Its settings will be lost.
+profiles.save=Save
+profiles.new_name=Profile {n}
+profiles.copy_name={name} (copy)

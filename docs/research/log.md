@@ -2,6 +2,24 @@
 
 Dated record of what was checked and what it proved. Each entry separates what was confirmed from what was not.
 
+## 2026-11-08 — Profiles
+
+**Pin:** Horizon Nightly `6560641ba51a452f6bc2407baa4eb1b3be517ca8`.
+
+**Change:** the header has a "Profile: ..." button that opens the profiles page: a list of profiles with the number of changed settings and an "Active" tag, and New profile, Use, Rename, Duplicate and Delete... buttons. A new profile is named right away (Enter saves, Escape cancels). A double click on a row uses that profile. Escape on the page goes back to the list.
+
+**Confirmed** (isolated offscreen runs, English and Russian):
+- an existing `settings.txt` became the first profile, with its setting;
+- New and typing named a profile, and the screen stayed open while typing;
+- Duplicate placed a copy under the selected profile with its settings file;
+- a double click switched profiles and saved the active one;
+- after switching, muting the weather group wrote only to the active profile's file;
+- the active profile could not be deleted; deleting another asked first and removed its file;
+- renaming saved the new name;
+- the earlier screen checks (21) and Mods page checks still pass with the profile files.
+
+**Not confirmed:** Mods page reset with more than one profile (the check ran with one profile); many profiles (the page shows as many rows as fit, without scrolling).
+
 ## 2026-11-08 — Mods page
 
 **Pin:** Horizon Nightly `6560641ba51a452f6bc2407baa4eb1b3be517ca8`.

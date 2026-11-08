@@ -2,9 +2,11 @@
 //! The launcher links this crate into the game and calls `hooks()`.
 mod core;
 mod i18n;
+mod profiles;
 mod ui;
 
 use crate::core::{Engine, MOD_ID, MOD_VERSION, SETTINGS_FILE, Settings, group_key, normalize, nudged};
+use crate::profiles::{PageHit, PageLayout, PageMeasure, PageState, Profiles};
 use crate::ui::{Hit, HeardView, Key, ListState, Rect, Row, SortAll, SortChanged, Tab, approach, fade, mix};
 use horizon_client::lang;
 use horizon_client::mod_api::{
@@ -121,6 +123,17 @@ struct State {
     close: bool,
     /// The Mods page asks to confirm "Reset all sound settings".
     page_confirm: bool,
+    /// `config/hushlist/`.
+    base: Option<PathBuf>,
+    profiles: Profiles,
+    /// The profiles page of the screen.
+    page: PageState,
+    /// "Using profile ..." after a switch, shown for a moment instead of the page hint.
+    page_msg: Option<(String, Instant)>,
+    /// Changed settings per profile id, read when the profiles page opens.
+    profile_counts: std::collections::HashMap<u32, usize>,
+    /// The last click on a profile row, to tell a double click.
+    last_item_click: Option<(usize, Instant)>,
     preview: Option<String>,
     drag: Option<Key>,
     trace: Option<std::fs::File>,
@@ -397,6 +410,7 @@ impl State {
             tabs,
             sort_items: sort_keys(self.list.tab).iter().map(|k| w(k)).collect(),
             buttons: [w("changed.reset_all"), w("button.reset"), w("button.cancel")],
+            profile: host.text_width(&self.profile_label(host)),
         };
         let banner = self.list.tab == Tab::Recent && self.list.frozen && fresh > 0;
         ui::layout(self.gui[0], self.gui[1], banner, &m, &self.list)
@@ -472,9 +486,208 @@ impl State {
         self.loaded = true;
         (self.subtitles, self.catalog) = read_sounds(host);
         if let Ok(dir) = host.config_dir() {
-            self.path = Some(dir.join(MOD_ID).join(SETTINGS_FILE));
+            self.load_profiles(dir.join(MOD_ID));
         }
         self.reload(now);
+    }
+
+    /// Reads the profile list. The first time, an older single settings file becomes the first profile.
+    fn load_profiles(&mut self, base: PathBuf) {
+        let index = base.join(profiles::INDEX_FILE);
+        self.profiles = match std::fs::read_to_string(&index) {
+            Ok(text) => Profiles::parse(&text),
+            Err(_) => {
+                let profiles = Profiles::default();
+                let _ = std::fs::create_dir_all(base.join(profiles::DIR));
+                let old = base.join(SETTINGS_FILE);
+                if old.exists() {
+                    let _ = std::fs::rename(&old, base.join(profiles::DIR).join(Profiles::file(profiles.active)));
+                }
+                let _ = std::fs::write(&index, profiles.to_text());
+                profiles
+            }
+        };
+        self.base = Some(base);
+        self.path = self.profile_path(self.profiles.active);
+    }
+
+    fn profile_path(&self, id: u32) -> Option<PathBuf> {
+        self.base.as_ref().map(|b| b.join(profiles::DIR).join(Profiles::file(id)))
+    }
+
+    fn save_index(&self) {
+        if let Some(base) = &self.base {
+            let _ = std::fs::create_dir_all(base);
+            let _ = std::fs::write(base.join(profiles::INDEX_FILE), self.profiles.to_text());
+        }
+    }
+
+    /// Profile `i`'s name as shown: the default one in the game's language when it has none.
+    fn profile_name(&self, i: usize) -> String {
+        match self.profiles.list.get(i) {
+            Some(p) if !p.name.is_empty() => p.name.clone(),
+            _ => tr("profile.default").to_owned(),
+        }
+    }
+
+    /// The header button's text, cut to fit.
+    fn profile_label(&self, host: &dyn Host) -> String {
+        let name = self.profile_name(self.profiles.active_index());
+        fit(host, &tr("profile.button").replace("{name}", &name), 150.0)
+    }
+
+    fn open_page(&mut self) {
+        self.page = PageState { open: true, sel: self.profiles.active_index(), ..PageState::default() };
+        self.list.search_focus = false;
+        self.list.sort_open = false;
+        self.list.confirm_reset = false;
+        self.last_item_click = None;
+        self.profile_counts.clear();
+        for p in &self.profiles.list {
+            if p.id == self.profiles.active {
+                continue;
+            }
+            let text = self.profile_path(p.id).and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+            self.profile_counts.insert(p.id, Settings::parse(&text).count());
+        }
+    }
+
+    fn profile_count(&self, i: usize) -> usize {
+        match self.profiles.list.get(i) {
+            Some(p) if p.id == self.profiles.active => self.engine.settings.count(),
+            Some(p) => self.profile_counts.get(&p.id).copied().unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    /// Makes profile `i` active: saves the current one, reads the new one and applies it at once.
+    fn switch_to(&mut self, i: usize, now: Instant) {
+        if self.profiles.list.get(i).is_none_or(|p| p.id == self.profiles.active) {
+            return;
+        }
+        if self.dirty_at.is_some() {
+            self.save();
+        }
+        let old = self.profiles.active;
+        self.profile_counts.insert(old, self.engine.settings.count());
+        self.profiles.set_active(i);
+        self.save_index();
+        self.path = self.profile_path(self.profiles.active);
+        let text = self.path.as_ref().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+        self.modified = self.path.as_ref().and_then(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok());
+        self.engine.settings = Settings::parse(&text);
+        self.changed_external();
+        self.list.before_mute.clear();
+        self.list.drawer = None;
+        self.list.confirm_reset = false;
+        self.page.sel = i;
+        self.page.delete = false;
+        self.page_msg = Some((tr("profiles.used").replace("{name}", &self.profile_name(i)), now));
+        let id = self.profiles.active;
+        self.trace_line(now, &format!("\"event\":\"profile\",\"id\":{id}"));
+    }
+
+    /// Saves the typed name of the row being renamed.
+    fn commit_name(&mut self) {
+        if let Some(i) = self.page.edit.take() {
+            let name = std::mem::take(&mut self.page.name);
+            if self.profiles.rename(i, &name) {
+                self.save_index();
+            }
+        }
+    }
+
+    fn page_layout(&self, host: &dyn Host, lay: &ui::Layout) -> PageLayout {
+        let w = |key: &'static str| host.text_width(tr(key));
+        let m = PageMeasure {
+            back: w("profiles.back"),
+            new: w("profiles.new"),
+            use_: w("profiles.use"),
+            rename: w("profiles.rename"),
+            duplicate: w("profiles.duplicate"),
+            delete: w("profiles.delete"),
+            save: w("profiles.save"),
+            cancel: w("button.cancel"),
+            delete_yes: w("profiles.delete_yes"),
+        };
+        profiles::page_layout(lay.panel, &m, &self.profiles, &self.page)
+    }
+
+    fn page_click(&mut self, hit: PageHit, now: Instant) {
+        let editing = self.page.edit.is_some();
+        match hit {
+            PageHit::Back => {
+                self.commit_name();
+                self.page.open = false;
+            }
+            PageHit::Item(i) => {
+                if editing {
+                    return;
+                }
+                self.page.delete = false;
+                let double = self
+                    .last_item_click
+                    .is_some_and(|(j, t)| j == i && now.saturating_duration_since(t) < Duration::from_millis(400));
+                self.page.sel = i;
+                self.last_item_click = Some((i, now));
+                if double {
+                    self.last_item_click = None;
+                    self.switch_to(i, now);
+                }
+            }
+            PageHit::New => {
+                let code = lang::code();
+                let name = i18n::with_n(&code, "profiles.new_name", self.profiles.list.len() + 1);
+                let i = self.profiles.add(&name);
+                self.save_index();
+                self.page.sel = i;
+                self.page.edit = Some(i);
+                self.page.name = self.profiles.list[i].name.clone();
+            }
+            PageHit::Use => self.switch_to(self.page.sel, now),
+            PageHit::Rename => {
+                self.page.edit = Some(self.page.sel);
+                self.page.name = self.profile_name(self.page.sel);
+            }
+            PageHit::Duplicate => {
+                let src = self.page.sel;
+                let Some(src_id) = self.profiles.list.get(src).map(|p| p.id) else { return };
+                if src_id == self.profiles.active && self.dirty_at.is_some() {
+                    self.save();
+                }
+                let name = tr("profiles.copy_name").replace("{name}", &self.profile_name(src));
+                let count = self.profile_count(src);
+                let Some(i) = self.profiles.duplicate(src, &name) else { return };
+                let id = self.profiles.list[i].id;
+                if let (Some(from), Some(to)) = (self.profile_path(src_id), self.profile_path(id))
+                    && from.exists()
+                {
+                    let _ = std::fs::copy(from, to);
+                }
+                self.profile_counts.insert(id, count);
+                self.save_index();
+                self.page.sel = i;
+            }
+            PageHit::Delete => self.page.delete = true,
+            PageHit::DeleteYes => {
+                if let Some(id) = self.profiles.delete(self.page.sel) {
+                    if let Some(f) = self.profile_path(id) {
+                        let _ = std::fs::remove_file(f);
+                    }
+                    self.profile_counts.remove(&id);
+                    self.save_index();
+                }
+                self.page.delete = false;
+                self.page.sel = self.profiles.active_index();
+            }
+            PageHit::Save => self.commit_name(),
+            PageHit::Cancel => {
+                self.page.edit = None;
+                self.page.name.clear();
+                self.page.delete = false;
+            }
+            PageHit::Nothing => {}
+        }
     }
 
     /// Reads the settings file when it changed outside the game.
@@ -578,6 +791,14 @@ impl Hooks for Hushlist {
         match (st.page_confirm, event.button) {
             (true, 0) => {
                 st.page_confirm = false;
+                let empty = Settings::default().to_text();
+                let others: Vec<u32> = st.profiles.list.iter().map(|p| p.id).filter(|id| *id != st.profiles.active).collect();
+                for id in others {
+                    if let Some(f) = st.profile_path(id).filter(|f| f.exists()) {
+                        let _ = std::fs::write(f, &empty);
+                    }
+                }
+                st.profile_counts.clear();
                 st.engine.settings = Settings::default();
                 st.list.before_mute.clear();
                 st.changed(now);
@@ -601,6 +822,7 @@ impl Hooks for Hushlist {
         } else if host.playing() && host.mod_screen_open(MOD_ID) {
             let mut st = self.lock();
             st.list.search_focus = false;
+            st.page = PageState::default();
             st.upload_icons(host);
         }
     }
@@ -707,6 +929,20 @@ impl Hooks for Hushlist {
             st.toggle_drawer(&id);
             return Flow::Cancel;
         }
+        if st.page.open {
+            let mouse = event.screen.mouse;
+            if ui::contains(lay.close, mouse) {
+                st.close = true;
+            } else if ui::contains(lay.profile, mouse) {
+                st.commit_name();
+                st.page.open = false;
+            } else {
+                let page = st.page_layout(host, &lay);
+                let hit = profiles::page_hit(&page, mouse);
+                st.page_click(hit, now);
+            }
+            return Flow::Cancel;
+        }
         let hit = ui::hit(&lay, &rows, st.list.scroll, event.screen.mouse);
         // A click anywhere else gives the keyboard back to the game's keys.
         st.list.search_focus = matches!(hit, Hit::Search | Hit::SearchClear);
@@ -718,6 +954,7 @@ impl Hooks for Hushlist {
         }
         match hit {
             Hit::Close => st.close = true,
+            Hit::Profile => st.open_page(),
             Hit::Tab(i) => {
                 let tab = Tab::ORDER[i];
                 if tab.ready() && tab != st.list.tab {
@@ -858,6 +1095,33 @@ impl Hooks for Hushlist {
         }
         let mut st = self.lock();
         let ctrl = event.modifiers & 2 != 0;
+        if st.page.open {
+            if st.page.edit.is_none() {
+                // Escape goes back to the list instead of closing the screen.
+                if event.key == "key.keyboard.escape" {
+                    st.page.open = false;
+                    st.page.delete = false;
+                    return Flow::Cancel;
+                }
+                return Flow::Continue;
+            }
+            match event.key {
+                "key.keyboard.backspace" => {
+                    if ctrl {
+                        st.page.name.clear();
+                    } else {
+                        st.page.name.pop();
+                    }
+                }
+                "key.keyboard.enter" | "key.keyboard.keypad.enter" => st.commit_name(),
+                "key.keyboard.escape" => {
+                    st.page.edit = None;
+                    st.page.name.clear();
+                }
+                _ => {}
+            }
+            return Flow::Cancel;
+        }
         if !st.list.search_focus {
             if ctrl && event.key == "key.keyboard.f" {
                 st.list.search_focus = true;
@@ -885,6 +1149,15 @@ impl Hooks for Hushlist {
             return Flow::Continue;
         }
         let mut st = self.lock();
+        if st.page.open {
+            if st.page.edit.is_none() {
+                return Flow::Continue;
+            }
+            if !event.c.is_control() && st.page.name.chars().count() < profiles::NAME_MAX {
+                st.page.name.push(event.c);
+            }
+            return Flow::Cancel;
+        }
         if !st.list.search_focus {
             return Flow::Continue;
         }
@@ -1012,8 +1285,8 @@ fn dump_rows(st: &mut State, rows: &[Row], lay: &ui::Layout, now: Instant) {
     let chips: Vec<String> = lay.chips.iter().map(|c| r(*c)).collect();
     let chip_ids: Vec<String> = st.list.chip_order().iter().map(|s| s.to_string()).collect();
     let layout = format!(
-        "{{\"search\":{},\"search_clear\":{},\"close\":{},\"chips\":[{}],\"chip_sources\":[{}],\"view_flat\":{},\"view_group\":{},\"banner\":{},\"list\":{},\"freeze\":{},\"query\":{:?},\"focus\":{},\"flat\":{},\"tab\":\"{:?}\",\"tabs\":[{}],\"sort\":{},\"sort_menu\":[{}],\"reset_all\":{},\"confirm_yes\":{},\"confirm_no\":{}}}",
-        r(lay.search), r(lay.search_clear), r(lay.close), chips.join(","), chip_ids.join(","), r(lay.view_flat),
+        "{{\"page\":\"list\",\"profile\":{},\"search\":{},\"search_clear\":{},\"close\":{},\"chips\":[{}],\"chip_sources\":[{}],\"view_flat\":{},\"view_group\":{},\"banner\":{},\"list\":{},\"freeze\":{},\"query\":{:?},\"focus\":{},\"flat\":{},\"tab\":\"{:?}\",\"tabs\":[{}],\"sort\":{},\"sort_menu\":[{}],\"reset_all\":{},\"confirm_yes\":{},\"confirm_no\":{}}}",
+        r(lay.profile), r(lay.search), r(lay.search_clear), r(lay.close), chips.join(","), chip_ids.join(","), r(lay.view_flat),
         r(lay.view_group), lay.banner.map_or("null".to_owned(), r), r(lay.list), r(lay.freeze), st.list.query,
         st.list.search_focus, st.list.flat, st.list.tab,
         lay.tab_rects.iter().map(|t| r(*t)).collect::<Vec<_>>().join(","),
@@ -1137,6 +1410,138 @@ fn draw_sort_menu(st: &State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
     }
 }
 
+/// The profiles page: a list like the game's world list, actions in the footer.
+fn draw_page(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layout, mouse: [f32; 2], now: Instant, now_ms: u128) {
+    let code = lang::code();
+    let pl = st.page_layout(host, lay);
+    let p = lay.panel;
+    button(host, b, pl.back, tr("profiles.back"), TEXT, EDGE, ui::contains(pl.back, mouse));
+    let title = tr("profiles.title");
+    host.text(b, title, pl.title, TEXT, false);
+    let hint_x = pl.title[0] + host.text_width(title) + 12.0;
+    let room = p[0] + p[2] - 10.0 - hint_x;
+    if st.page_msg.as_ref().is_some_and(|(_, t)| now.saturating_duration_since(*t) > Duration::from_millis(2500)) {
+        st.page_msg = None;
+    }
+    match &st.page_msg {
+        Some((msg, _)) => host.text(b, &fit(host, msg, room), [hint_x, pl.title[1]], OWN, false),
+        None => host.text(b, &fit(host, tr("profiles.hint"), room), [hint_x, pl.title[1]], DIM, false),
+    }
+    host.fill(b, [p[0] + 1.0, pl.back[1] + pl.back[3] + 4.0, p[2] - 2.0, 1.0], EDGE);
+
+    let active = st.profiles.active_index();
+    for (i, r) in pl.items.iter().enumerate() {
+        let sel = i == st.page.sel;
+        let hover = ui::contains(*r, mouse);
+        if sel {
+            rrect(host, b, *r, 4.0, 0x73_FF_FF_FF);
+            rrect(host, b, [r[0] + 1.0, r[1] + 1.0, r[2] - 2.0, r[3] - 2.0], 3.0, argb(0x26_25_2E));
+        } else {
+            rrect(host, b, *r, 4.0, if hover { ROW_HOVER } else { ROW });
+        }
+        let mut right = r[0] + r[2] - 10.0;
+        if i == active {
+            let tag = tr("profiles.active");
+            let tw = host.text_width(tag);
+            let t = [right - tw - 12.0, r[1] + 8.0, tw + 12.0, 14.0];
+            rrect(host, b, t, 7.0, 0x66_6F_F0_DA);
+            rrect(host, b, [t[0] + 1.0, t[1] + 1.0, t[2] - 2.0, t[3] - 2.0], 6.0, argb(if sel { 0x26_25_2E } else { 0x1B_1A_20 }));
+            host.text(b, tag, [t[0] + 6.0, t[1] + 3.0], OWN, false);
+            right = t[0] - 8.0;
+        }
+        let name_room = right - r[0] - 10.0;
+        if st.page.edit == Some(i) {
+            let f = [r[0] + 6.0, r[1] + 3.0, name_room.min(240.0), 13.0];
+            rrect(host, b, f, 3.0, FIELD_EDGE_FOCUS);
+            rrect(host, b, [f[0] + 1.0, f[1] + 1.0, f[2] - 2.0, f[3] - 2.0], 2.0, FIELD);
+            let mut shown: &str = &st.page.name;
+            while host.text_width(shown) > f[2] - 10.0 {
+                let mut chars = shown.chars();
+                chars.next();
+                shown = chars.as_str();
+            }
+            host.text(b, shown, [f[0] + 4.0, f[1] + 3.0], TEXT, false);
+            if (now_ms / 530) % 2 == 0 {
+                host.fill(b, [f[0] + 5.0 + host.text_width(shown), f[1] + 3.0, 1.0, 8.0], argb(TEXT));
+            }
+        } else {
+            host.text(b, &fit(host, &st.profile_name(i), name_room), [r[0] + 10.0, r[1] + 6.0], TEXT, false);
+        }
+        let meta = i18n::with_n(&code, "profiles.meta", st.profile_count(i));
+        host.text(b, &meta, [r[0] + 10.0, r[1] + 18.0], FAINT, false);
+    }
+    if let Some(n) = pl.note {
+        host.text(b, &fit(host, tr("profiles.active_no_delete"), p[2] - 24.0), n, FAINT, false);
+    }
+
+    let btn = |host: &dyn Host, b: &mut HudBatch, r: Option<Rect>, key: &'static str, enabled: bool, danger: bool| {
+        let Some(r) = r else { return };
+        let rgb = if !enabled {
+            FAINT
+        } else if danger {
+            DANGER
+        } else {
+            TEXT
+        };
+        let edge = if danger && enabled { 0x80_FF_8A_7A } else { EDGE };
+        button(host, b, r, tr(key), rgb, edge, enabled && ui::contains(r, mouse));
+    };
+    btn(host, b, pl.new, "profiles.new", true, false);
+    btn(host, b, pl.use_, "profiles.use", pl.can_use, false);
+    btn(host, b, pl.rename, "profiles.rename", true, false);
+    btn(host, b, pl.duplicate, "profiles.duplicate", true, false);
+    btn(host, b, pl.delete, "profiles.delete", pl.can_delete, true);
+    btn(host, b, pl.save, "profiles.save", true, false);
+    btn(host, b, pl.delete_yes, "profiles.delete_yes", true, true);
+    btn(host, b, pl.cancel, "button.cancel", true, false);
+    if pl.delete_yes.is_some() {
+        let q = tr("profiles.delete_q").replace("{name}", &st.profile_name(st.page.sel));
+        host.text(b, &fit(host, &q, pl.foot_room), pl.foot_text, TEXT, false);
+    }
+    dump_page(st, lay, &pl, now);
+}
+
+/// What the profiles page shows, for test scripts (`HUSHLIST_TRACE`).
+fn dump_page(st: &mut State, lay: &ui::Layout, pl: &PageLayout, now: Instant) {
+    let Some(trace) = std::env::var_os("HUSHLIST_TRACE") else { return };
+    if st.rows_dumped.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(250)) {
+        return;
+    }
+    st.rows_dumped = Some(now);
+    let r = |r: Rect| format!("[{},{},{},{}]", r[0], r[1], r[2], r[3]);
+    let o = |x: Option<Rect>| x.map_or("null".to_owned(), r);
+    let names: Vec<String> = (0..st.profiles.list.len()).map(|i| format!("{:?}", st.profile_name(i))).collect();
+    let counts: Vec<String> = (0..st.profiles.list.len()).map(|i| st.profile_count(i).to_string()).collect();
+    let ids: Vec<String> = st.profiles.list.iter().map(|p| p.id.to_string()).collect();
+    let layout = format!(
+        "{{\"page\":\"profiles\",\"profile\":{},\"close\":{},\"p_back\":{},\"p_items\":[{}],\"p_new\":{},\"p_use\":{},\"p_rename\":{},\"p_dup\":{},\"p_del\":{},\"p_save\":{},\"p_cancel\":{},\"p_del_yes\":{},\"p_sel\":{},\"p_edit\":{},\"p_name\":{:?},\"p_names\":[{}],\"p_counts\":[{}],\"p_ids\":[{}],\"p_active\":{},\"p_can_use\":{},\"p_can_delete\":{}}}",
+        r(lay.profile),
+        r(lay.close),
+        r(pl.back),
+        pl.items.iter().map(|x| r(*x)).collect::<Vec<_>>().join(","),
+        o(pl.new),
+        o(pl.use_),
+        o(pl.rename),
+        o(pl.duplicate),
+        o(pl.delete),
+        o(pl.save),
+        o(pl.cancel),
+        o(pl.delete_yes),
+        st.page.sel,
+        st.page.edit.map_or("null".to_owned(), |e| e.to_string()),
+        st.page.name,
+        names.join(","),
+        counts.join(","),
+        ids.join(","),
+        st.profiles.active,
+        pl.can_use,
+        pl.can_delete
+    );
+    let mut path = std::path::PathBuf::from(trace);
+    path.as_mut_os_string().push(".rows.json");
+    let _ = std::fs::write(path, format!("{{\"layout\":{layout},\"rows\":[]}}"));
+}
+
 fn row_id(row: &Row) -> String {
     match &row.key {
         Key::Group(g) => format!("g:{g}"),
@@ -1183,6 +1588,20 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
     }
     let close_tone = if close_hover { Tone::Text } else { Tone::Dim };
     icon(host, b, Icon::Close, close_tone, [lay.close[0] + 2.0, lay.close[1], ICON_SIZE, lay.close[3]]);
+
+    // Profile button: opens the profiles page, and goes back from it.
+    let pr = lay.profile;
+    let p_hot = st.page.open || ui::contains(pr, mouse);
+    rrect(host, b, pr, 3.0, if p_hot { 0x40_FF_FF_FF } else { EDGE });
+    let p_fill = argb(if st.page.open { 0x2E_2C_36 } else { 0x16_15_1B });
+    rrect(host, b, [pr[0] + 1.0, pr[1] + 1.0, pr[2] - 2.0, pr[3] - 2.0], 2.0, p_fill);
+    host.text(b, &st.profile_label(host), [pr[0] + 7.0, pr[1] + 4.0], if p_hot { TEXT } else { DIM }, false);
+
+    if st.page.open {
+        draw_page(st, host, b, &lay, mouse, now, now_ms);
+        return;
+    }
+
 
     // Search field: placeholder, typed text (its end when long), caret while it has the keyboard.
     let s = lay.search;

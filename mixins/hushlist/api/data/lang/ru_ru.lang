@@ -151,4 +151,25 @@ group.entity.boat=Лодка
 mod.description=Делает тише отдельные звуки: живой список того, что вы слышите, и громкость для каждого звука и группы.
 key.open=Клавиша открытия
 page.reset=Сбросить все настройки звуков…
-page.reset_yes=Да, сбросить все настройки звуков
+page.reset_yes=Да, сбросить во всех профилях
+
+# Profiles
+profile.button=Профиль: {name}
+profile.default=Обычный
+profiles.title=Профили
+profiles.back=Назад
+profiles.hint=Все изменения звуков записываются в активный профиль.
+profiles.used=Используется профиль “{name}”
+profiles.active=Активный
+profiles.meta=изменено: {n}
+profiles.active_no_delete=Активный профиль удалить нельзя. Сначала используйте другой.
+profiles.new=Новый профиль
+profiles.use=Использовать
+profiles.rename=Переименовать
+profiles.duplicate=Дублировать
+profiles.delete=Удалить…
+profiles.delete_yes=Удалить
+profiles.delete_q=Удалить профиль “{name}”? Его настройки пропадут.
+profiles.save=Сохранить
+profiles.new_name=Профиль {n}
+profiles.copy_name={name} (копия)

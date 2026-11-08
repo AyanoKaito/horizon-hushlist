@@ -176,6 +176,8 @@ pub struct Measure {
     pub sort_items: Vec<f32>,
     /// "Reset all", "Reset", "Cancel".
     pub buttons: [f32; 3],
+    /// The header's "Profile: ..." label, already cut to fit.
+    pub profile: f32,
 }
 
 impl Measure {
@@ -824,6 +826,8 @@ pub struct Layout {
     /// The × inside the search field, shown while there is text.
     pub search_clear: Rect,
     pub close: Rect,
+    /// The header's "Profile: ..." button: opens the profiles page.
+    pub profile: Rect,
     pub tabs: Rect,
     /// Category chips in drawing order ([`ListState::chip_order`]).
     pub chips: Vec<Rect>,
@@ -860,7 +864,9 @@ pub fn layout(width: f32, height: f32, banner: bool, m: &Measure, st: &ListState
     // Inner margin of the panel.
     let pad = 8.0;
     let close = [x + w - pad - 16.0, y + 6.0, 16.0, 16.0];
-    let search = [x + 76.0, y + 6.0, (close[0] - 8.0 - x - 76.0).max(40.0), 16.0];
+    let profile = [x + 70.0, y + 6.0, m.profile + 14.0, 16.0];
+    let search_x = profile[0] + profile[2] + 6.0;
+    let search = [search_x, y + 6.0, (close[0] - 8.0 - search_x).max(40.0), 16.0];
     let search_clear = [search[0] + search[2] - 16.0, search[1], 16.0, 16.0];
     let tabs = [x + pad, y + 28.0, w - 2.0 * pad, 16.0];
     let tools_top = y + 52.0;
@@ -914,6 +920,7 @@ pub fn layout(width: f32, height: f32, banner: bool, m: &Measure, st: &ListState
         search,
         search_clear,
         close,
+        profile,
         tabs,
         chips,
         view_flat,
@@ -1008,6 +1015,8 @@ pub fn slider_value(slider: Rect, x: f32) -> u8 {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Hit {
     Close,
+    /// The header's profile button.
+    Profile,
     Search,
     SearchClear,
     /// A chip by its drawing position.
@@ -1049,6 +1058,9 @@ pub fn hit(lay: &Layout, rows: &[Row], scroll: f32, p: [f32; 2]) -> Hit {
     }
     if contains(lay.close, p) {
         return Hit::Close;
+    }
+    if contains(lay.profile, p) {
+        return Hit::Profile;
     }
     if let Some(i) = lay.tab_rects.iter().position(|r| contains(*r, p)) {
         return Hit::Tab(i);
