@@ -887,7 +887,16 @@ impl State {
         let origin = [e.x - span / 2, e.z - span / 2];
         let tkey = (world.clone(), origin, span);
         if self.map.terrain_key.as_ref() != Some(&tkey) {
-            self.map.terrain = read_terrain(host, origin, span);
+            let (colors, heights, ids) = read_terrain_full(host, origin, span);
+            self.map.terrain = colors;
+            // Test scripts read the surface around the player from here (`HUSHLIST_TRACE` only).
+            if let Some(trace) = std::env::var_os("HUSHLIST_TRACE") {
+                let mut path = std::path::PathBuf::from(trace);
+                path.as_mut_os_string().push(".map.json");
+                let h: Vec<String> = heights.iter().map(|v| if *v == i32::MIN { "null".to_owned() } else { v.to_string() }).collect();
+                let i: Vec<String> = ids.iter().map(u8::to_string).collect();
+                let _ = std::fs::write(path, format!("{{\"origin\":[{},{}],\"span\":{span},\"heights\":[{}],\"ids\":[{}]}}", origin[0], origin[1], h.join(","), i.join(",")));
+            }
             self.map.terrain_key = Some(tkey);
             self.map.image_key = None;
         }
@@ -2052,15 +2061,17 @@ fn mix_rgb(a: u32, b: u32, t: f32) -> u32 {
 
 /// Map colours of the blocks seen from above, shaded like the game's maps: a block higher than its
 /// northern neighbour is lighter, a lower one darker. Columns not loaded stay dark.
-fn read_terrain(host: &dyn Host, origin: [i32; 2], span: i32) -> Vec<u32> {
+/// Also the surface heights (i32::MIN where not loaded) and MapColor ids per column.
+fn read_terrain_full(host: &dyn Host, origin: [i32; 2], span: i32) -> (Vec<u32>, Vec<i32>, Vec<u8>) {
     let n = span as usize;
     let mut colors = vec![0x20_20_24u32; n * n];
     let from = [origin[0].div_euclid(16), origin[1].div_euclid(16)];
     let to = [(origin[0] + span - 1).div_euclid(16), (origin[1] + span - 1).div_euclid(16)];
-    let Ok(snap) = host.client_chunks(from, to) else { return colors };
+    let Ok(snap) = host.client_chunks(from, to) else { return (colors, vec![i32::MIN; n * n], vec![0; n * n]) };
     let low = snap.height().start;
     let mut heights = vec![i32::MIN; n * n];
     let mut water = vec![false; n * n];
+    let mut ids = vec![0u8; n * n];
     for dz in 0..n {
         for dx in 0..n {
             let (bx, bz) = (origin[0] + dx as i32, origin[1] + dz as i32);
@@ -2077,6 +2088,7 @@ fn read_terrain(host: &dyn Host, origin: [i32; 2], span: i32) -> Vec<u32> {
                     heights[i] = y;
                     // MapColor.WATER: flat, as the game's maps show water without relief.
                     water[i] = id == 12;
+                    ids[i] = id;
                     break;
                 }
                 y -= 1;
@@ -2100,7 +2112,7 @@ fn read_terrain(host: &dyn Host, origin: [i32; 2], span: i32) -> Vec<u32> {
             mix_rgb(0, colors[i], f as f32 / 255.0)
         })
         .collect();
-    shaded
+    (shaded, heights, ids)
 }
 
 /// Inside a zone: back, the zone's name, the sub-tabs, "Edit shape" and "Delete...", and the line
