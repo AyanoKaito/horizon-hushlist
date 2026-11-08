@@ -119,8 +119,6 @@ struct State {
     dirty_at: Option<Instant>,
     refresh: Refresh,
     close: bool,
-    /// "Open Hushlist" was clicked on the Mods page: open the screen once the player is back in the game.
-    open_pending: bool,
     /// The Mods page asks to confirm "Reset all sound settings".
     page_confirm: bool,
     preview: Option<String>,
@@ -554,8 +552,8 @@ impl Hooks for Hushlist {
         });
     }
 
-    /// The Mods page buttons: open the screen, reset everything (with a confirmation step).
-    fn settings(&self, host: &mut dyn Host, event: &mut SettingsEvent<'_>) {
+    /// The Mods page button: reset everything, with a confirmation step.
+    fn settings(&self, _host: &mut dyn Host, event: &mut SettingsEvent<'_>) {
         if event.mod_id != MOD_ID {
             return;
         }
@@ -565,14 +563,6 @@ impl Hooks for Hushlist {
             event.buttons.push(tr("button.cancel").to_owned());
             return;
         }
-        let open = if host.player().is_none() {
-            "page.open_no_world"
-        } else if st.open_pending {
-            "page.open_pending"
-        } else {
-            "page.open"
-        };
-        event.buttons.push(tr(open).to_owned());
         event.buttons.push(tr("page.reset").to_owned());
     }
 
@@ -594,7 +584,6 @@ impl Hooks for Hushlist {
                 st.save();
             }
             (true, _) => st.page_confirm = false,
-            (false, 0) => st.open_pending = host.player().is_some(),
             (false, _) => st.page_confirm = true,
         }
     }
@@ -630,15 +619,6 @@ impl Hooks for Hushlist {
             }
         } else {
             st.icons_live = false;
-        }
-        if st.open_pending {
-            if host.player().is_none() {
-                st.open_pending = false;
-            } else if host.playing() && host.mod_screen_open(MOD_ID) {
-                st.open_pending = false;
-                st.list.search_focus = false;
-                st.upload_icons(host);
-            }
         }
         if std::mem::take(&mut st.close) && host.mod_screen() == Some(MOD_ID) {
             host.mod_screen_close(MOD_ID);
