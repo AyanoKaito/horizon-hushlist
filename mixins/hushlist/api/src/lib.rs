@@ -122,6 +122,10 @@ struct State {
     anim: Anim,
     /// Sound event ID to subtitle key, from the game's sounds.json.
     subtitles: std::collections::HashMap<String, String>,
+    /// Every sound event of the game by group, from the same file.
+    catalog: ui::Catalog,
+    /// When the visible rows were last written for tests (`HUSHLIST_TRACE`).
+    rows_dumped: Option<Instant>,
     /// When the live order was last refreshed.
     live_at: Option<Instant>,
 }
@@ -175,18 +179,26 @@ fn sound_name(subtitles: &std::collections::HashMap<String, String>, id: &str) -
     }
 }
 
-/// Subtitle keys of every sound event, read from the game's `sounds.json`.
-fn read_subtitles(host: &dyn Host) -> std::collections::HashMap<String, String> {
+/// Subtitle keys and the list of every sound event, read from the game's `sounds.json`.
+fn read_sounds(host: &dyn Host) -> (std::collections::HashMap<String, String>, ui::Catalog) {
     let Some(bytes) = host.client_resources().read("assets/minecraft/sounds.json") else {
         return Default::default();
     };
     let Ok(serde_json::Value::Object(events)) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return Default::default();
     };
-    events
+    let catalog = ui::Catalog::from_ids(events.keys().map(String::as_str));
+    let subtitles = events
         .into_iter()
         .filter_map(|(id, event)| Some((id, event.get("subtitle")?.as_str()?.to_owned())))
-        .collect()
+        .collect();
+    (subtitles, catalog)
+}
+
+/// The sound has no subtitle, so its name is only its ID made readable.
+fn technical_name(subtitles: &std::collections::HashMap<String, String>, id: &str) -> bool {
+    let id = normalize(id);
+    !id.starts_with("music_disc.") && !subtitles.contains_key(id)
 }
 
 /// A group's name: the mob, block or item it belongs to, or the family name.
@@ -247,11 +259,15 @@ impl State {
 
     fn rows(&mut self, now: Instant) -> (Vec<HeardView>, Vec<Row>, usize) {
         let views = self.views(now);
-        if !self.list.frozen && self.live_at.is_none_or(|t| now.saturating_duration_since(t) >= LIVE_REORDER) {
+        // The live order waits while a slider is held, so the row does not move under the pointer.
+        if !self.list.frozen
+            && self.drag.is_none()
+            && self.live_at.is_none_or(|t| now.saturating_duration_since(t) >= LIVE_REORDER)
+        {
             self.list.live = Some(ui::snapshot(&views));
             self.live_at = Some(now);
         }
-        let (mut rows, mut fresh) = ui::build(&views, &self.engine.settings, &self.list);
+        let (mut rows, mut fresh) = ui::build(&views, &self.engine.settings, &self.list, &self.catalog);
         // A group that collapsed because something in it keeps playing stays collapsed.
         let mut pinned = false;
         for row in &rows {
@@ -264,7 +280,7 @@ impl State {
             }
         }
         if pinned {
-            (rows, fresh) = ui::build(&views, &self.engine.settings, &self.list);
+            (rows, fresh) = ui::build(&views, &self.engine.settings, &self.list, &self.catalog);
         }
         (views, rows, fresh)
     }
@@ -282,6 +298,7 @@ impl State {
         match key {
             Key::Sound(id) => s.sounds.insert(id.clone(), value),
             Key::Group(g) => s.groups.insert(g.clone(), value),
+            Key::More(_) => return,
         };
         self.changed(now);
     }
@@ -291,6 +308,7 @@ impl State {
         match key {
             Key::Sound(id) => s.sounds.remove(id),
             Key::Group(g) => s.groups.remove(g),
+            Key::More(_) => return,
         };
         self.list.before_mute.remove(key);
         self.changed(now);
@@ -308,7 +326,7 @@ impl State {
 
     fn load(&mut self, host: &dyn Host, now: Instant) {
         self.loaded = true;
-        self.subtitles = read_subtitles(host);
+        (self.subtitles, self.catalog) = read_sounds(host);
         if let Ok(dir) = host.config_dir() {
             self.path = Some(dir.join(MOD_ID).join(SETTINGS_FILE));
         }
@@ -519,6 +537,11 @@ impl Hooks for Hushlist {
                     st.list.open.insert(g.clone(), open);
                 }
                 Key::Sound(id) => st.preview = Some(id.clone()),
+                Key::More(g) => {
+                    if !st.list.show_all.remove(g) {
+                        st.list.show_all.insert(g.clone());
+                    }
+                }
             },
             Hit::Nothing => {}
         }
@@ -644,10 +667,33 @@ fn rrect(host: &dyn Host, b: &mut HudBatch, r: Rect, radius: f32, argb: u32) {
     }
 }
 
+/// With `HUSHLIST_TRACE` set, writes the visible rows (identity and rectangle) to
+/// `<trace>.rows.json`, so an automated test can find a row by its sound.
+fn dump_rows(st: &mut State, rows: &[Row], list: Rect, now: Instant) {
+    let Some(trace) = std::env::var_os("HUSHLIST_TRACE") else { return };
+    if st.rows_dumped.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(250)) {
+        return;
+    }
+    st.rows_dumped = Some(now);
+    let items: Vec<String> = ui::visible(rows.len(), list, st.list.scroll)
+        .into_iter()
+        .map(|(i, r)| {
+            format!(
+                "{{\"id\":\"{}\",\"child\":{},\"own\":{},\"volume\":{},\"count\":{},\"rect\":[{},{},{},{}]}}",
+                row_id(&rows[i]), rows[i].child, rows[i].own, rows[i].volume, rows[i].count, r[0], r[1], r[2], r[3]
+            )
+        })
+        .collect();
+    let mut path = std::path::PathBuf::from(trace);
+    path.as_mut_os_string().push(".rows.json");
+    let _ = std::fs::write(path, format!("[{}]", items.join(",")));
+}
+
 fn row_id(row: &Row) -> String {
     match &row.key {
         Key::Group(g) => format!("g:{g}"),
         Key::Sound(s) => format!("{}:{s}", if row.child { "c" } else { "s" }),
+        Key::More(g) => format!("m:{g}"),
     }
 }
 
@@ -758,6 +804,22 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
             let f = 1.0 - row.secs / ui::FLASH_SECS;
             bg = mix(bg, ROW_FLASH, f * f * (3.0 - 2.0 * f));
         }
+        if let Key::More(_) = &row.key {
+            // A quiet button, not a sound row: no background, a thin outline, one label.
+            let label = if row.open {
+                tr("group.hide_unheard").to_owned()
+            } else {
+                i18n::with_n(&code, "group.more", row.count)
+            };
+            let w = host.text_width(&label) + 16.0;
+            let btn = [c.name[0] - 4.0, r[1] + 4.0, w, r[3] - 8.0];
+            let edge = fade(mix(EDGE, 0xFF_FF_FF_FF, 0.15 * h), reveal);
+            rrect(host, b, btn, 3.0, edge);
+            rrect(host, b, [btn[0] + 1.0, btn[1] + 1.0, btn[2] - 2.0, btn[3] - 2.0], 2.0, fade(mix(BG, ROW_HOVER, h), reveal));
+            let rgb = if hover { TEXT } else { DIM };
+            host.text(b, &label, [btn[0] + 8.0, btn[1] + 3.0], rgb, false);
+            continue;
+        }
         rrect(host, b, bg_rect, 3.0, fade(bg, reveal));
 
         let (name, detail) = match &row.key {
@@ -786,15 +848,18 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
                 };
                 (sound_name(&st.subtitles, sid), format!("{source}minecraft:{sid}"))
             }
+            Key::More(_) => unreachable!("drawn above"),
         };
-        let name_rgb = if row.volume == 0 { FAINT } else { TEXT };
+        // The game font has no italics for mods, so a name made from the ID is drawn dimmer.
+        let technical = matches!(&row.key, Key::Sound(sid) if technical_name(&st.subtitles, sid));
+        let name_rgb = if row.volume == 0 { FAINT } else if technical { DIM } else { TEXT };
         host.text(b, &fit(host, &name, c.name[2]), [c.name[0], r[1] + 3.0], name_rgb, false);
         host.text(b, &fit(host, &detail, c.name[2]), [c.name[0], r[1] + 12.0], FAINT, false);
 
         let when = ui::when_text(row, &code);
         let when_rgb = if row.playing || row.flash { AMBER } else { DIM };
         host.text(b, &when, [c.when[0] + c.when[2] - host.text_width(&when), r[1] + 3.0], when_rgb, false);
-        if !row.playing {
+        if !row.playing && row.count > 0 {
             let count = format!("×{}", row.count);
             host.text(b, &count, [c.when[0] + c.when[2] - host.text_width(&count), r[1] + 12.0], FAINT, false);
         }
@@ -851,6 +916,7 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
             icon(host, b, Icon::Reset, Tone::Own, [c.reset[0] + 1.0, c.reset[1], ICON_SIZE, c.reset[3]]);
         }
     }
+    dump_rows(st, &rows, list, now);
     st.anim.y.retain(|k, _| seen.contains(k));
     st.anim.reveal.retain(|k, _| seen.contains(k));
     st.anim.hover.retain(|k, _| seen.contains(k));

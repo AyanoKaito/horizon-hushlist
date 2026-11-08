@@ -2,7 +2,7 @@
 // drawn, and what a click hits. No game types, so it is tested standalone; the
 // trait mod (lib.rs) only draws these rectangles and forwards input.
 use crate::core::{Settings, group_key};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// One row's height in GUI pixels: a name line and a detail line.
 pub const ROW_H: f32 = 22.0;
@@ -15,11 +15,35 @@ pub const FLASH_SECS: f32 = 0.9;
 /// Groups of sounds that usually play for a long time; they start collapsed.
 pub const CONSTANT_FAMILIES: [&str; 4] = ["weather", "music", "music_disc", "ambient"];
 
-/// A row's identity: a group (by group key) or a sound (by sound event ID).
+/// A row's identity: a group (by group key), a sound (by sound event ID), or
+/// the "N more in this group" button under an expanded group.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Key {
     Group(String),
     Sound(String),
+    More(String),
+}
+
+/// Every sound event of the game by group, sorted, for showing a group's unheard sounds.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Catalog {
+    pub groups: HashMap<String, Vec<String>>,
+}
+
+impl Catalog {
+    pub fn from_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+        for id in ids {
+            if let Some(g) = group_key(id) {
+                groups.entry(g).or_default().push(crate::core::normalize(id).to_owned());
+            }
+        }
+        for v in groups.values_mut() {
+            v.sort();
+            v.dedup();
+        }
+        Catalog { groups }
+    }
 }
 
 /// What the list knows about one heard sound.
@@ -86,6 +110,8 @@ pub struct ListState {
     pub scroll: f32,
     /// Volume before mute, to restore it.
     pub before_mute: HashMap<Key, u8>,
+    /// Expanded groups that also show the sounds not heard yet.
+    pub show_all: HashSet<String>,
 }
 
 impl ListState {
@@ -154,14 +180,14 @@ pub fn snapshot(heard: &[HeardView]) -> Snapshot {
             .iter()
             .filter_map(|e| match &e.key {
                 Key::Group(g) => Some((g.clone(), e.kids.clone())),
-                Key::Sound(_) => None,
+                Key::Sound(_) | Key::More(_) => None,
             })
             .collect(),
     }
 }
 
 /// The rows to draw and, while frozen, how many heard sounds the frozen order leaves out.
-pub fn build(heard: &[HeardView], settings: &Settings, st: &ListState) -> (Vec<Row>, usize) {
+pub fn build(heard: &[HeardView], settings: &Settings, st: &ListState, catalog: &Catalog) -> (Vec<Row>, usize) {
     let live = entries(heard);
     let mut fresh = 0;
     let order = if st.frozen { st.snapshot.as_ref() } else { st.live.as_ref() };
@@ -188,7 +214,7 @@ pub fn build(heard: &[HeardView], settings: &Settings, st: &ListState) -> (Vec<R
                             kids: known.into_iter().filter(|k| e.kids.contains(k)).collect(),
                         }
                     }
-                    Key::Sound(_) => e.clone(),
+                    Key::Sound(_) | Key::More(_) => e.clone(),
                 })
                 .collect()
         }
@@ -225,11 +251,46 @@ pub fn build(heard: &[HeardView], settings: &Settings, st: &ListState) -> (Vec<R
                 });
                 if open {
                     rows.extend(kids.iter().map(|k| sound_row(k, settings, true)));
+                    let all = catalog.groups.get(g).map(Vec::as_slice).unwrap_or(&[]);
+                    let rest: Vec<&String> = all.iter().filter(|id| !e.kids.contains(id)).collect();
+                    let show_all = st.show_all.contains(g);
+                    if show_all {
+                        for id in &rest {
+                            let unheard = HeardView {
+                                id: (*id).clone(),
+                                secs: f32::INFINITY,
+                                count: 0,
+                                playing: false,
+                            };
+                            rows.push(sound_row(&unheard, settings, true));
+                        }
+                    }
+                    if !rest.is_empty() {
+                        rows.push(more_row(g, rest.len(), show_all));
+                    }
                 }
             }
+            Key::More(_) => {}
         }
     }
     (rows, fresh)
+}
+
+/// The button under an expanded group: "N more in this group", or "heard only" while all are shown.
+fn more_row(group: &str, rest: usize, showing_all: bool) -> Row {
+    Row {
+        key: Key::More(group.to_owned()),
+        child: true,
+        open: showing_all,
+        playing: false,
+        flash: false,
+        secs: f32::INFINITY,
+        count: rest as u32,
+        heard: Vec::new(),
+        volume: 100,
+        own: false,
+        inherited: false,
+    }
 }
 
 fn sound_row(h: &HeardView, settings: &Settings, child: bool) -> Row {
@@ -389,6 +450,9 @@ pub fn hit(lay: &Layout, rows: &[Row], scroll: f32, p: [f32; 2]) -> Hit {
         if !contains(r, p) {
             continue;
         }
+        if matches!(rows[i].key, Key::More(_)) {
+            return Hit::Row(i);
+        }
         let c = columns(r, rows[i].child);
         return if contains(c.speaker, p) {
             Hit::Speaker(i)
@@ -410,6 +474,9 @@ pub fn when_text(row: &Row, lang: &str) -> String {
     use crate::i18n::{text, with_n};
     if row.playing {
         return text(lang, "when.playing").to_owned();
+    }
+    if !row.secs.is_finite() {
+        return String::new();
     }
     let s = row.secs.max(0.0);
     if s < 2.0 {
@@ -496,6 +563,7 @@ mod tests {
             .map(|r| match &r.key {
                 Key::Group(g) => format!("G:{g}"),
                 Key::Sound(s) => format!("{}{s}", if r.child { "  " } else { "S:" }),
+                Key::More(g) => format!("M:{g}"),
             })
             .collect()
     }
@@ -509,7 +577,7 @@ mod tests {
             h("entity.villager.ambient", 2.0, false),
             h("item.nautilus_saddle_equip", 5.0, false),
         ];
-        let (rows, fresh) = build(&heard, &Settings::default(), &ListState::default());
+        let (rows, fresh) = build(&heard, &Settings::default(), &ListState::default(), &Catalog::default());
         assert_eq!(fresh, 0);
         assert_eq!(
             keys(&rows),
@@ -536,7 +604,7 @@ mod tests {
             ..ListState::default()
         };
         let after = [h("entity.chicken.ambient", 0.2, false), h("entity.cow.ambient", 3.0, false)];
-        let (rows, fresh) = build(&after, &Settings::default(), &st);
+        let (rows, fresh) = build(&after, &Settings::default(), &st, &Catalog::default());
         assert_eq!(keys(&rows)[0], "G:entity.cow");
         assert_eq!(fresh, 0);
     }
@@ -544,7 +612,7 @@ mod tests {
     #[test]
     fn constant_families_start_collapsed() {
         let heard = [h("music.overworld.forest", 3.0, false), h("block.portal.ambient", 1.0, false)];
-        let (rows, _) = build(&heard, &Settings::default(), &ListState::default());
+        let (rows, _) = build(&heard, &Settings::default(), &ListState::default(), &Catalog::default());
         assert_eq!(keys(&rows), ["G:block.portal", "  block.portal.ambient", "G:music"]);
     }
 
@@ -554,7 +622,7 @@ mod tests {
         let mut st = ListState::default();
         st.open.insert("weather".into(), true);
         st.open.insert("entity.cow".into(), false);
-        let (rows, _) = build(&heard, &Settings::default(), &st);
+        let (rows, _) = build(&heard, &Settings::default(), &st, &Catalog::default());
         assert_eq!(keys(&rows), ["G:weather", "  weather.rain", "G:entity.cow"]);
     }
 
@@ -562,7 +630,7 @@ mod tests {
     fn volumes_show_own_and_inherited_values() {
         let heard = [h("entity.chicken.ambient", 1.0, false), h("entity.chicken.egg", 2.0, false)];
         let s = Settings::parse("group entity.chicken 30\nsound entity.chicken.egg 50\n");
-        let (rows, _) = build(&heard, &s, &ListState::default());
+        let (rows, _) = build(&heard, &s, &ListState::default(), &Catalog::default());
         assert_eq!((rows[0].volume, rows[0].own), (30, true));
         assert_eq!((rows[1].volume, rows[1].own, rows[1].inherited), (30, false, true));
         assert_eq!((rows[2].volume, rows[2].own, rows[2].inherited), (50, true, false));
@@ -583,7 +651,7 @@ mod tests {
             h("entity.chicken.step", 0.5, false),
             h("entity.zombie.ambient", 0.1, false),
         ];
-        let (rows, fresh) = build(&after, &Settings::default(), &st);
+        let (rows, fresh) = build(&after, &Settings::default(), &st, &Catalog::default());
         assert_eq!(
             keys(&rows),
             ["G:entity.cow", "  entity.cow.ambient", "G:entity.chicken", "  entity.chicken.ambient"]
@@ -591,7 +659,7 @@ mod tests {
         assert_eq!(fresh, 2);
         // The banner applies them once; the list stays frozen.
         st.snapshot = Some(snapshot(&after));
-        let (rows, fresh) = build(&after, &Settings::default(), &st);
+        let (rows, fresh) = build(&after, &Settings::default(), &st, &Catalog::default());
         assert_eq!(fresh, 0);
         assert_eq!(keys(&rows)[0], "G:entity.zombie");
         assert_eq!(rows.len(), 7);
@@ -623,7 +691,7 @@ mod tests {
     fn clicks_hit_the_part_under_the_pointer() {
         let heard = [h("entity.chicken.ambient", 1.0, false), h("entity.chicken.egg", 2.0, false)];
         let s = Settings::parse("sound entity.chicken.egg 50\n");
-        let (rows, _) = build(&heard, &s, &ListState::default());
+        let (rows, _) = build(&heard, &s, &ListState::default(), &Catalog::default());
         let lay = layout(640.0, 360.0, false);
         let vis = visible(rows.len(), lay.list, 0.0);
         let mid = |r: Rect| [r[0] + r[2] / 2.0, r[1] + r[3] / 2.0];
@@ -708,6 +776,24 @@ mod tests {
         assert_eq!(mix(0xFF_00_00_00, 0xFF_FF_FF_FF, 0.0), 0xFF_00_00_00);
         assert_eq!(mix(0xFF_00_00_00, 0xFF_FF_FF_FF, 1.0), 0xFF_FF_FF_FF);
         assert_eq!(mix(0x00_00_00_00, 0xFF_FF_00_00, 0.5), 0x80_80_00_00);
+    }
+
+    #[test]
+    fn expanded_group_offers_its_unheard_sounds() {
+        let heard = [h("entity.cow.ambient", 1.0, false)];
+        let catalog = Catalog::from_ids(["entity.cow.ambient", "minecraft:entity.cow.hurt", "entity.cow.step", "ui.button.click"]);
+        let (rows, _) = build(&heard, &Settings::default(), &ListState::default(), &catalog);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2].key, Key::More("entity.cow".into()));
+        assert_eq!((rows[2].count, rows[2].open), (2, false));
+
+        let mut st = ListState::default();
+        st.show_all.insert("entity.cow".into());
+        let (rows, _) = build(&heard, &Settings::default(), &st, &catalog);
+        assert_eq!(keys(&rows), ["G:entity.cow", "  entity.cow.ambient", "  entity.cow.hurt", "  entity.cow.step", "M:entity.cow"]);
+        assert!(rows[4].open);
+        assert_eq!(when_text(&rows[2], "en_us"), "");
+        assert_eq!(rows[2].count, 0);
     }
 
     #[test]
