@@ -23,6 +23,21 @@ when.now=now
 when.seconds={n}s
 when.minutes={n}m
 
+search.placeholder=Name, ID or category
+empty.nothing=Nothing found
+group.from=from group “{name}”
+
+# Sound categories (chips)
+cat.block=Blocks
+cat.neutral=Friendly
+cat.hostile=Hostile
+cat.player=Players
+cat.weather=Weather
+cat.ambient=Ambient
+cat.music=Music
+cat.record=Jukebox
+cat.ui=UI
+
 # Sound families
 group.music=Music
 group.music_disc=Music Discs
@@ -109,3 +124,5 @@ group.item.axe=Axe
 group.item.bottle=Bottle
 group.item.spear=Spear
 group.item.spear_wood=Wooden spear
+group.block.grass=Grass
+group.entity.boat=Boat

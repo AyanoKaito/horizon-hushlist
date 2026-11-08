@@ -23,6 +23,21 @@ when.now=сейчас
 when.seconds={n} с
 when.minutes={n} мин
 
+search.placeholder=Название, ID или категория
+empty.nothing=Ничего не найдено
+group.from=из группы “{name}”
+
+# Sound categories (chips)
+cat.block=Блоки
+cat.neutral=Мирные
+cat.hostile=Враждебные
+cat.player=Игроки
+cat.weather=Погода
+cat.ambient=Окружение
+cat.music=Музыка
+cat.record=Пластинки
+cat.ui=Интерфейс
+
 # Sound families
 group.music=Музыка
 group.music_disc=Пластинки
@@ -109,3 +124,5 @@ group.item.axe=Топор
 group.item.bottle=Бутылочка
 group.item.spear=Копьё
 group.item.spear_wood=Деревянное копьё
+group.block.grass=Трава
+group.entity.boat=Лодка

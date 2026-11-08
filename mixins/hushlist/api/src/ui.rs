@@ -14,6 +14,26 @@ pub const CHILD_INDENT: f32 = 12.0;
 pub const FLASH_SECS: f32 = 0.9;
 /// Groups of sounds that usually play for a long time; they start collapsed.
 pub const CONSTANT_FAMILIES: [&str; 4] = ["weather", "music", "music_disc", "ambient"];
+/// Category chips in their default order: the game's sound source index and
+/// the translation key of the chip. Master and voice have no chip.
+pub const CATEGORIES: [(usize, &str); 9] = [
+    (4, "cat.block"),
+    (6, "cat.neutral"),
+    (5, "cat.hostile"),
+    (7, "cat.player"),
+    (3, "cat.weather"),
+    (8, "cat.ambient"),
+    (1, "cat.music"),
+    (2, "cat.record"),
+    (10, "cat.ui"),
+];
+/// Longest search text.
+pub const QUERY_MAX: usize = 40;
+
+/// The chip's translation key for a sound source index.
+pub fn category_key(source: usize) -> Option<&'static str> {
+    CATEGORIES.iter().find(|(s, _)| *s == source).map(|(_, k)| *k)
+}
 
 /// A row's identity: a group (by group key), a sound (by sound event ID), or
 /// the "N more in this group" button under an expanded group.
@@ -55,6 +75,8 @@ pub struct HeardView {
     pub count: u32,
     /// Still getting live updates (a long or looping sound).
     pub playing: bool,
+    /// The game's sound source index of the last play (its category).
+    pub source: usize,
 }
 
 /// A top-level entry before flattening: a group with its heard sounds, or a sound without a group.
@@ -112,6 +134,14 @@ pub struct ListState {
     pub before_mute: HashMap<Key, u8>,
     /// Expanded groups that also show the sounds not heard yet.
     pub show_all: HashSet<String>,
+    /// Search text as typed; matching ignores case. Empty shows everything.
+    pub query: String,
+    /// The search field takes the keyboard.
+    pub search_focus: bool,
+    /// Selected category chips (sound source indices), in the order they were picked.
+    pub cats: Vec<usize>,
+    /// Flat list instead of groups.
+    pub flat: bool,
 }
 
 impl ListState {
@@ -124,18 +154,38 @@ impl ListState {
             .copied()
             .unwrap_or(!(has_playing || CONSTANT_FAMILIES.contains(&group)))
     }
+
+    /// Chips as drawn: the picked ones first, in the order they were picked, then the rest.
+    pub fn chip_order(&self) -> Vec<usize> {
+        let mut out = self.cats.clone();
+        out.extend(CATEGORIES.iter().map(|(s, _)| *s).filter(|s| !self.cats.contains(s)));
+        out
+    }
+
+    pub fn toggle_cat(&mut self, source: usize) {
+        if let Some(i) = self.cats.iter().position(|s| *s == source) {
+            self.cats.remove(i);
+        } else {
+            self.cats.push(source);
+        }
+    }
+
+    /// Search or chips hide part of the list.
+    pub fn filtering(&self) -> bool {
+        !self.query.is_empty() || !self.cats.is_empty()
+    }
 }
 
 fn by_id<'a>(heard: &'a [HeardView]) -> HashMap<&'a str, &'a HeardView> {
     heard.iter().map(|h| (h.id.as_str(), h)).collect()
 }
 
-/// Live order: playing entries first, then by latest start.
-pub fn entries(heard: &[HeardView]) -> Vec<Entry> {
+/// Live order: playing entries first, then by latest start. `flat` lists sounds without groups.
+pub fn entries(heard: &[HeardView], flat: bool) -> Vec<Entry> {
     let mut groups: Vec<(String, Vec<&HeardView>)> = Vec::new();
     let mut out: Vec<(Entry, bool, f32)> = Vec::new();
     for h in heard {
-        match group_key(&h.id) {
+        match group_key(&h.id).filter(|_| !flat) {
             Some(g) => match groups.iter_mut().find(|(k, _)| *k == g) {
                 Some((_, kids)) => kids.push(h),
                 None => groups.push((g, vec![h])),
@@ -172,8 +222,8 @@ pub fn entries(heard: &[HeardView]) -> Vec<Entry> {
 }
 
 /// The order to freeze now.
-pub fn snapshot(heard: &[HeardView]) -> Snapshot {
-    let es = entries(heard);
+pub fn snapshot(heard: &[HeardView], flat: bool) -> Snapshot {
+    let es = entries(heard, flat);
     Snapshot {
         order: es.iter().map(|e| e.key.clone()).collect(),
         kids: es
@@ -187,8 +237,21 @@ pub fn snapshot(heard: &[HeardView]) -> Snapshot {
 }
 
 /// The rows to draw and, while frozen, how many heard sounds the frozen order leaves out.
-pub fn build(heard: &[HeardView], settings: &Settings, st: &ListState, catalog: &Catalog) -> (Vec<Row>, usize) {
-    let live = entries(heard);
+/// `matches` says whether a sound ID fits the search text (names live in the game, not here).
+pub fn build(
+    heard: &[HeardView],
+    settings: &Settings,
+    st: &ListState,
+    catalog: &Catalog,
+    matches: &dyn Fn(&str) -> bool,
+) -> (Vec<Row>, usize) {
+    let heard: Vec<HeardView> = heard
+        .iter()
+        .filter(|h| (st.cats.is_empty() || st.cats.contains(&h.source)) && matches(&h.id))
+        .cloned()
+        .collect();
+    let heard = heard.as_slice();
+    let live = entries(heard, st.flat);
     let mut fresh = 0;
     let order = if st.frozen { st.snapshot.as_ref() } else { st.live.as_ref() };
     let shown: Vec<Entry> = match order {
@@ -252,7 +315,11 @@ pub fn build(heard: &[HeardView], settings: &Settings, st: &ListState, catalog: 
                 if open {
                     rows.extend(kids.iter().map(|k| sound_row(k, settings, true)));
                     let all = catalog.groups.get(g).map(Vec::as_slice).unwrap_or(&[]);
-                    let rest: Vec<&String> = all.iter().filter(|id| !e.kids.contains(id)).collect();
+                    // Unheard sounds have no category yet, so chips hide them; the search still applies.
+                    let rest: Vec<&String> = all
+                        .iter()
+                        .filter(|id| st.cats.is_empty() && !e.kids.contains(id) && matches(id))
+                        .collect();
                     let show_all = st.show_all.contains(g);
                     if show_all {
                         for id in &rest {
@@ -261,6 +328,7 @@ pub fn build(heard: &[HeardView], settings: &Settings, st: &ListState, catalog: 
                                 secs: f32::INFINITY,
                                 count: 0,
                                 playing: false,
+                                source: 0,
                             };
                             rows.push(sound_row(&unheard, settings, true));
                         }
@@ -319,24 +387,54 @@ pub fn contains(r: Rect, p: [f32; 2]) -> bool {
 }
 
 /// Where the screen's parts are, for a GUI of `width` × `height`.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Layout {
     pub panel: Rect,
     pub title: [f32; 2],
+    pub search: Rect,
+    /// The × inside the search field, shown while there is text.
+    pub search_clear: Rect,
     pub close: Rect,
     pub tabs: Rect,
+    /// Category chips in drawing order ([`ListState::chip_order`]).
+    pub chips: Vec<Rect>,
+    pub view_flat: Rect,
+    pub view_group: Rect,
     pub banner: Option<Rect>,
     pub list: Rect,
     pub freeze: Rect,
 }
 
-pub fn layout(width: f32, height: f32, banner: bool) -> Layout {
+/// Height of a chip and of the view buttons.
+pub const CHIP_H: f32 = 13.0;
+
+/// `chip_text` holds the text width of each chip label, in drawing order;
+/// chips wrap onto more lines when they do not fit.
+pub fn layout(width: f32, height: f32, banner: bool, chip_text: &[f32]) -> Layout {
     let w = (width - 24.0).clamp(300.0, 640.0).min(width);
     let h = (height - 24.0).max(160.0).min(height);
     let x = ((width - w) / 2.0).floor();
     let y = ((height - h) / 2.0).floor();
+    let close = [x + w - 20.0, y + 4.0, 14.0, 14.0];
+    let search = [x + 70.0, y + 4.0, (close[0] - 6.0 - x - 70.0).max(40.0), 14.0];
+    let search_clear = [search[0] + search[2] - 14.0, search[1], 14.0, 14.0];
     let tabs = [x + 6.0, y + 22.0, w - 12.0, 14.0];
-    let mut top = y + 40.0;
+    let tools_top = y + 42.0;
+    let view_group = [x + w - 6.0 - 16.0, tools_top, 16.0, CHIP_H];
+    let view_flat = [view_group[0] - 16.0, tools_top, 16.0, CHIP_H];
+    let chips_right = view_flat[0] - 8.0;
+    let mut chips = Vec::with_capacity(chip_text.len());
+    let (mut cx, mut cy) = (x + 6.0, tools_top);
+    for tw in chip_text {
+        let cw = tw + 12.0;
+        if cx > x + 6.0 && cx + cw > chips_right {
+            cx = x + 6.0;
+            cy += CHIP_H + 3.0;
+        }
+        chips.push([cx, cy, cw, CHIP_H]);
+        cx += cw + 4.0;
+    }
+    let mut top = cy + CHIP_H + 5.0;
     let banner = banner.then(|| {
         let r = [x + 6.0, top, w - 12.0, 14.0];
         top += 16.0;
@@ -346,8 +444,13 @@ pub fn layout(width: f32, height: f32, banner: bool) -> Layout {
     Layout {
         panel: [x, y, w, h],
         title: [x + 8.0, y + 7.0],
-        close: [x + w - 20.0, y + 4.0, 14.0, 14.0],
+        search,
+        search_clear,
+        close,
         tabs,
+        chips,
+        view_flat,
+        view_group,
         banner,
         list: [x + 6.0, top, w - 12.0, (y + h - 26.0 - top).max(0.0)],
         freeze,
@@ -426,6 +529,12 @@ pub fn slider_value(slider: Rect, x: f32) -> u8 {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Hit {
     Close,
+    Search,
+    SearchClear,
+    /// A chip by its drawing position.
+    Chip(usize),
+    ViewFlat,
+    ViewGroup,
     Freeze,
     Banner,
     Speaker(usize),
@@ -439,6 +548,21 @@ pub enum Hit {
 pub fn hit(lay: &Layout, rows: &[Row], scroll: f32, p: [f32; 2]) -> Hit {
     if contains(lay.close, p) {
         return Hit::Close;
+    }
+    if contains(lay.search_clear, p) {
+        return Hit::SearchClear;
+    }
+    if contains(lay.search, p) {
+        return Hit::Search;
+    }
+    if let Some(i) = lay.chips.iter().position(|c| contains(*c, p)) {
+        return Hit::Chip(i);
+    }
+    if contains(lay.view_flat, p) {
+        return Hit::ViewFlat;
+    }
+    if contains(lay.view_group, p) {
+        return Hit::ViewGroup;
     }
     if contains(lay.freeze, p) {
         return Hit::Freeze;
@@ -555,6 +679,7 @@ mod tests {
             secs,
             count: 1,
             playing,
+            source: 6,
         }
     }
 
@@ -577,7 +702,7 @@ mod tests {
             h("entity.villager.ambient", 2.0, false),
             h("item.nautilus_saddle_equip", 5.0, false),
         ];
-        let (rows, fresh) = build(&heard, &Settings::default(), &ListState::default(), &Catalog::default());
+        let (rows, fresh) = build(&heard, &Settings::default(), &ListState::default(), &Catalog::default(), &|_| true);
         assert_eq!(fresh, 0);
         assert_eq!(
             keys(&rows),
@@ -600,11 +725,11 @@ mod tests {
     fn live_order_refreshes_on_its_own_schedule_and_never_counts_new_sounds() {
         let before = [h("entity.cow.ambient", 1.0, false), h("entity.chicken.ambient", 5.0, false)];
         let st = ListState {
-            live: Some(snapshot(&before)),
+            live: Some(snapshot(&before, false)),
             ..ListState::default()
         };
         let after = [h("entity.chicken.ambient", 0.2, false), h("entity.cow.ambient", 3.0, false)];
-        let (rows, fresh) = build(&after, &Settings::default(), &st, &Catalog::default());
+        let (rows, fresh) = build(&after, &Settings::default(), &st, &Catalog::default(), &|_| true);
         assert_eq!(keys(&rows)[0], "G:entity.cow");
         assert_eq!(fresh, 0);
     }
@@ -612,7 +737,7 @@ mod tests {
     #[test]
     fn constant_families_start_collapsed() {
         let heard = [h("music.overworld.forest", 3.0, false), h("block.portal.ambient", 1.0, false)];
-        let (rows, _) = build(&heard, &Settings::default(), &ListState::default(), &Catalog::default());
+        let (rows, _) = build(&heard, &Settings::default(), &ListState::default(), &Catalog::default(), &|_| true);
         assert_eq!(keys(&rows), ["G:block.portal", "  block.portal.ambient", "G:music"]);
     }
 
@@ -622,7 +747,7 @@ mod tests {
         let mut st = ListState::default();
         st.open.insert("weather".into(), true);
         st.open.insert("entity.cow".into(), false);
-        let (rows, _) = build(&heard, &Settings::default(), &st, &Catalog::default());
+        let (rows, _) = build(&heard, &Settings::default(), &st, &Catalog::default(), &|_| true);
         assert_eq!(keys(&rows), ["G:weather", "  weather.rain", "G:entity.cow"]);
     }
 
@@ -630,7 +755,7 @@ mod tests {
     fn volumes_show_own_and_inherited_values() {
         let heard = [h("entity.chicken.ambient", 1.0, false), h("entity.chicken.egg", 2.0, false)];
         let s = Settings::parse("group entity.chicken 30\nsound entity.chicken.egg 50\n");
-        let (rows, _) = build(&heard, &s, &ListState::default(), &Catalog::default());
+        let (rows, _) = build(&heard, &s, &ListState::default(), &Catalog::default(), &|_| true);
         assert_eq!((rows[0].volume, rows[0].own), (30, true));
         assert_eq!((rows[1].volume, rows[1].own, rows[1].inherited), (30, false, true));
         assert_eq!((rows[2].volume, rows[2].own, rows[2].inherited), (50, true, false));
@@ -641,7 +766,7 @@ mod tests {
         let before = [h("entity.cow.ambient", 1.0, false), h("entity.chicken.ambient", 5.0, false)];
         let mut st = ListState {
             frozen: true,
-            snapshot: Some(snapshot(&before)),
+            snapshot: Some(snapshot(&before, false)),
             ..ListState::default()
         };
         // Chickens play again, a chick and a zombie are new.
@@ -651,15 +776,15 @@ mod tests {
             h("entity.chicken.step", 0.5, false),
             h("entity.zombie.ambient", 0.1, false),
         ];
-        let (rows, fresh) = build(&after, &Settings::default(), &st, &Catalog::default());
+        let (rows, fresh) = build(&after, &Settings::default(), &st, &Catalog::default(), &|_| true);
         assert_eq!(
             keys(&rows),
             ["G:entity.cow", "  entity.cow.ambient", "G:entity.chicken", "  entity.chicken.ambient"]
         );
         assert_eq!(fresh, 2);
         // The banner applies them once; the list stays frozen.
-        st.snapshot = Some(snapshot(&after));
-        let (rows, fresh) = build(&after, &Settings::default(), &st, &Catalog::default());
+        st.snapshot = Some(snapshot(&after, false));
+        let (rows, fresh) = build(&after, &Settings::default(), &st, &Catalog::default(), &|_| true);
         assert_eq!(fresh, 0);
         assert_eq!(keys(&rows)[0], "G:entity.zombie");
         assert_eq!(rows.len(), 7);
@@ -668,7 +793,7 @@ mod tests {
     #[test]
     fn layout_parts_do_not_overlap() {
         for (w, h) in [(427.0, 240.0), (640.0, 360.0), (960.0, 540.0)] {
-            let lay = layout(w, h, true);
+            let lay = layout(w, h, true, &[]);
             assert!(lay.panel[0] >= 0.0 && lay.panel[0] + lay.panel[2] <= w);
             let b = lay.banner.unwrap();
             assert!(b[1] + b[3] <= lay.list[1]);
@@ -691,8 +816,8 @@ mod tests {
     fn clicks_hit_the_part_under_the_pointer() {
         let heard = [h("entity.chicken.ambient", 1.0, false), h("entity.chicken.egg", 2.0, false)];
         let s = Settings::parse("sound entity.chicken.egg 50\n");
-        let (rows, _) = build(&heard, &s, &ListState::default(), &Catalog::default());
-        let lay = layout(640.0, 360.0, false);
+        let (rows, _) = build(&heard, &s, &ListState::default(), &Catalog::default(), &|_| true);
+        let lay = layout(640.0, 360.0, false, &[]);
         let vis = visible(rows.len(), lay.list, 0.0);
         let mid = |r: Rect| [r[0] + r[2] / 2.0, r[1] + r[3] / 2.0];
         let c1 = columns(vis[1].1, true);
@@ -782,18 +907,53 @@ mod tests {
     fn expanded_group_offers_its_unheard_sounds() {
         let heard = [h("entity.cow.ambient", 1.0, false)];
         let catalog = Catalog::from_ids(["entity.cow.ambient", "minecraft:entity.cow.hurt", "entity.cow.step", "ui.button.click"]);
-        let (rows, _) = build(&heard, &Settings::default(), &ListState::default(), &catalog);
+        let (rows, _) = build(&heard, &Settings::default(), &ListState::default(), &catalog, &|_| true);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[2].key, Key::More("entity.cow".into()));
         assert_eq!((rows[2].count, rows[2].open), (2, false));
 
         let mut st = ListState::default();
         st.show_all.insert("entity.cow".into());
-        let (rows, _) = build(&heard, &Settings::default(), &st, &catalog);
+        let (rows, _) = build(&heard, &Settings::default(), &st, &catalog, &|_| true);
         assert_eq!(keys(&rows), ["G:entity.cow", "  entity.cow.ambient", "  entity.cow.hurt", "  entity.cow.step", "M:entity.cow"]);
         assert!(rows[4].open);
         assert_eq!(when_text(&rows[2], "en_us"), "");
         assert_eq!(rows[2].count, 0);
+    }
+
+    #[test]
+    fn chips_filter_by_category_and_search_by_id() {
+        let mut rain = h("weather.rain", 0.5, false);
+        rain.source = 3;
+        let heard = [rain, h("entity.cow.ambient", 1.0, false), h("entity.chicken.ambient", 2.0, false)];
+        let mut st = ListState::default();
+        st.toggle_cat(3);
+        let (rows, _) = build(&heard, &Settings::default(), &st, &Catalog::default(), &|_| true);
+        assert_eq!(keys(&rows), ["G:weather"]);
+        assert_eq!(st.chip_order()[0], 3);
+        st.toggle_cat(3);
+        assert!(!st.filtering());
+        let (rows, _) = build(&heard, &Settings::default(), &st, &Catalog::default(), &|id| id.contains("chicken"));
+        assert_eq!(keys(&rows), ["G:entity.chicken", "  entity.chicken.ambient"]);
+    }
+
+    #[test]
+    fn flat_view_lists_sounds_without_groups() {
+        let heard = [h("entity.cow.ambient", 1.0, false), h("entity.cow.step", 0.5, false), h("ui.button.click", 2.0, false)];
+        let st = ListState { flat: true, ..ListState::default() };
+        let (rows, _) = build(&heard, &Settings::default(), &st, &Catalog::default(), &|_| true);
+        assert_eq!(keys(&rows), ["S:entity.cow.step", "S:entity.cow.ambient", "S:ui.button.click"]);
+    }
+
+    #[test]
+    fn chips_wrap_when_the_row_is_full() {
+        let lay = layout(640.0, 360.0, false, &[40.0; 9]);
+        assert_eq!(lay.chips.len(), 9);
+        assert!(lay.chips.iter().all(|c| c[0] + c[2] <= lay.view_flat[0]));
+        let narrow = layout(320.0, 360.0, false, &[40.0; 9]);
+        assert!(narrow.chips[8][1] > narrow.chips[0][1]);
+        assert!(narrow.list[1] > lay.list[1]);
+        assert_eq!(hit(&lay, &[], 0.0, [lay.chips[2][0] + 1.0, lay.chips[2][1] + 1.0]), Hit::Chip(2));
     }
 
     #[test]

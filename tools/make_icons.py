@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw
 CELL = 24
 SS = 8  # supersampling
 ICONS = ["speaker_high", "speaker_low", "speaker_off", "reset", "timer", "play", "snowflake",
-         "close", "chevron_right", "chevron_down", "view_list", "view_groups", "sort"]
+         "close", "chevron_right", "chevron_down", "view_list", "view_groups", "sort", "search"]
 COLOURS = {  # row order is the contract with lib.rs
     "text": (0xEE, 0xEC, 0xF4),
     "dim": (0x9D, 0x99, 0xAD),
@@ -106,6 +106,9 @@ def draw(name):
         line(d, [(4.5, 15.5), (8, 19), (11.5, 15.5)], 1.8)
         line(d, [(16, 19.5), (16, 5)], 1.8)
         line(d, [(12.5, 8.5), (16, 5), (19.5, 8.5)], 1.8)
+    elif name == "search":
+        arc(d, 10, 10, 5.8, 0, 360, 2.2)
+        line(d, [(14.4, 14.4), (19.5, 19.5)], 2.6)
     return img.resize((CELL, CELL), Image.LANCZOS)
 
 

@@ -10,7 +10,8 @@ use horizon_client::lang;
 use horizon_client::mod_api::{
     ClientTickPostEvent, Flow, Hooks, Host, HudBatch, KeyEvent, ModsEvent, NativeMod,
     ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent, ScreenMouseDraggedPreEvent,
-    ScreenMouseScrolledPreEvent, ScreenRenderPostEvent, SoundPlayEvent,
+    ScreenCharTypedPreEvent, ScreenKeyPressedPreEvent, ScreenMouseScrolledPreEvent, ScreenRenderPostEvent,
+    SoundPlayEvent,
 };
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
@@ -46,6 +47,9 @@ const AMBER: u32 = 0xF5_B1_42;
 const OWN: u32 = 0x6F_F0_DA;
 const INH: u32 = 0x4E_7A_75;
 const ICE_TEXT: u32 = 0x12_30_3F;
+const FIELD: u32 = 0xFF_0E_0D_12;
+const FIELD_EDGE_FOCUS: u32 = 0x55_FF_FF_FF;
+const CHIP_ON_TEXT: u32 = 0x17_15_1E;
 
 // Icon sheet (tools/make_icons.py): one column per icon, one row per colour,
 // 24 px cells drawn into 12 GUI pixels. Uploaded into the mods' image slot.
@@ -65,6 +69,9 @@ enum Icon {
     Close = 7,
     ChevronRight = 8,
     ChevronDown = 9,
+    ViewList = 10,
+    ViewGroups = 11,
+    Search = 13,
 }
 
 #[derive(Clone, Copy)]
@@ -253,6 +260,7 @@ impl State {
                 secs: now.saturating_duration_since(h.last).as_secs_f32(),
                 count: h.count,
                 playing: h.playing(now),
+                source: h.source,
             })
             .collect()
     }
@@ -264,10 +272,11 @@ impl State {
             && self.drag.is_none()
             && self.live_at.is_none_or(|t| now.saturating_duration_since(t) >= LIVE_REORDER)
         {
-            self.list.live = Some(ui::snapshot(&views));
+            self.list.live = Some(ui::snapshot(&views, self.list.flat));
             self.live_at = Some(now);
         }
-        let (mut rows, mut fresh) = ui::build(&views, &self.engine.settings, &self.list, &self.catalog);
+        let (mut rows, mut fresh) =
+            ui::build(&views, &self.engine.settings, &self.list, &self.catalog, &self.matcher());
         // A group that collapsed because something in it keeps playing stays collapsed.
         let mut pinned = false;
         for row in &rows {
@@ -280,9 +289,55 @@ impl State {
             }
         }
         if pinned {
-            (rows, fresh) = ui::build(&views, &self.engine.settings, &self.list, &self.catalog);
+            (rows, fresh) = ui::build(&views, &self.engine.settings, &self.list, &self.catalog, &self.matcher());
         }
         (views, rows, fresh)
+    }
+
+    /// Whether a sound fits the search text: its name, ID, group name or category, any case.
+    fn matcher(&self) -> impl Fn(&str) -> bool + '_ {
+        let query = self.list.query.trim().to_lowercase();
+        let code = lang::code();
+        move |id: &str| {
+            if query.is_empty() {
+                return true;
+            }
+            let mut hay = sound_name(&self.subtitles, id);
+            hay.push(' ');
+            hay.push_str(normalize(id));
+            if let Some(g) = group_key(id) {
+                hay.push(' ');
+                hay.push_str(&group_name(&g));
+            }
+            if let Some(cat) = self.engine.recent.get(normalize(id)).and_then(|h| ui::category_key(h.source)) {
+                hay.push(' ');
+                hay.push_str(i18n::text(&code, cat));
+            }
+            hay.to_lowercase().contains(&query)
+        }
+    }
+
+    /// Search, chips or view changed: the list takes the new shape at once.
+    fn filter_changed(&mut self, now: Instant) {
+        self.list.live = None;
+        self.live_at = None;
+        self.list.scroll = 0.0;
+        if self.list.frozen {
+            let views = self.views(now);
+            self.list.snapshot = Some(ui::snapshot(&views, self.list.flat));
+        }
+    }
+
+    /// The screen layout for this GUI size; chips are measured in the game's font.
+    fn layout(&self, host: &dyn Host, fresh: usize) -> ui::Layout {
+        let code = lang::code();
+        let widths: Vec<f32> = self
+            .list
+            .chip_order()
+            .iter()
+            .map(|s| host.text_width(i18n::text(&code, ui::category_key(*s).unwrap_or_default())))
+            .collect();
+        ui::layout(self.gui[0], self.gui[1], self.list.frozen && fresh > 0, &widths)
     }
 
     fn changed(&mut self, now: Instant) {
@@ -417,7 +472,9 @@ impl Hooks for Hushlist {
         if host.mod_screen() == Some(MOD_ID) {
             host.mod_screen_close(MOD_ID);
         } else if host.playing() && host.mod_screen_open(MOD_ID) {
-            self.lock().upload_icons(host);
+            let mut st = self.lock();
+            st.list.search_focus = false;
+            st.upload_icons(host);
         }
     }
 
@@ -517,14 +574,41 @@ impl Hooks for Hushlist {
         let now = Instant::now();
         let mut st = self.lock();
         let (views, rows, fresh) = st.rows(now);
-        let lay = ui::layout(st.gui[0], st.gui[1], st.list.frozen && fresh > 0);
-        match ui::hit(&lay, &rows, st.list.scroll, event.screen.mouse) {
+        let lay = st.layout(host, fresh);
+        let hit = ui::hit(&lay, &rows, st.list.scroll, event.screen.mouse);
+        // A click anywhere else gives the keyboard back to the game's keys.
+        st.list.search_focus = matches!(hit, Hit::Search | Hit::SearchClear);
+        match hit {
             Hit::Close => st.close = true,
+            Hit::Search => {}
+            Hit::SearchClear => {
+                if !st.list.query.is_empty() {
+                    st.list.query.clear();
+                    st.filter_changed(now);
+                }
+            }
+            Hit::Chip(i) => {
+                if let Some(&source) = st.list.chip_order().get(i) {
+                    st.list.toggle_cat(source);
+                    st.filter_changed(now);
+                }
+            }
+            Hit::ViewFlat | Hit::ViewGroup => {
+                let flat = matches!(hit, Hit::ViewFlat);
+                if st.list.flat != flat {
+                    st.list.flat = flat;
+                    st.filter_changed(now);
+                    // A different kind of list: rows appear in place instead of gliding across each other.
+                    st.anim.y.clear();
+                    st.anim.reveal.clear();
+                }
+            }
             Hit::Freeze => {
                 st.list.frozen = !st.list.frozen;
-                st.list.snapshot = st.list.frozen.then(|| ui::snapshot(&views));
+                let flat = st.list.flat;
+                st.list.snapshot = st.list.frozen.then(|| ui::snapshot(&views, flat));
             }
-            Hit::Banner => st.list.snapshot = Some(ui::snapshot(&views)),
+            Hit::Banner => st.list.snapshot = Some(ui::snapshot(&views, st.list.flat)),
             Hit::Speaker(i) => st.toggle_mute(&rows[i], now),
             Hit::Slider(i, v) => {
                 st.drag = Some(rows[i].key.clone());
@@ -568,7 +652,7 @@ impl Hooks for Hushlist {
         let mut st = self.lock();
         let Some(key) = st.drag.clone() else { return Flow::Cancel };
         let (_, rows, fresh) = st.rows(now);
-        let lay = ui::layout(st.gui[0], st.gui[1], st.list.frozen && fresh > 0);
+        let lay = st.layout(host, fresh);
         if let Some((i, r)) = ui::visible(rows.len(), lay.list, st.list.scroll)
             .into_iter()
             .find(|(i, _)| rows[*i].key == key)
@@ -576,6 +660,51 @@ impl Hooks for Hushlist {
             let slider = ui::columns(r, rows[i].child).slider;
             let v = ui::slider_value(slider, event.screen.mouse[0]);
             st.set_volume(&key, v, now);
+        }
+        Flow::Cancel
+    }
+
+    /// While the search field has the keyboard, keys edit it and do nothing else
+    /// (so H types an "h" instead of closing the screen). Ctrl+F puts the keyboard there.
+    fn screen_key_pressed_pre(&self, host: &dyn Host, event: &mut ScreenKeyPressedPreEvent<'_>) -> Flow {
+        if host.mod_screen() != Some(MOD_ID) {
+            return Flow::Continue;
+        }
+        let mut st = self.lock();
+        let ctrl = event.modifiers & 2 != 0;
+        if !st.list.search_focus {
+            if ctrl && event.key == "key.keyboard.f" {
+                st.list.search_focus = true;
+                return Flow::Cancel;
+            }
+            return Flow::Continue;
+        }
+        match event.key {
+            "key.keyboard.backspace" => {
+                if ctrl {
+                    st.list.query.clear();
+                } else {
+                    st.list.query.pop();
+                }
+                st.filter_changed(Instant::now());
+            }
+            "key.keyboard.escape" | "key.keyboard.enter" | "key.keyboard.keypad.enter" => st.list.search_focus = false,
+            _ => {}
+        }
+        Flow::Cancel
+    }
+
+    fn screen_char_typed_pre(&self, host: &dyn Host, event: &mut ScreenCharTypedPreEvent<'_>) -> Flow {
+        if host.mod_screen() != Some(MOD_ID) {
+            return Flow::Continue;
+        }
+        let mut st = self.lock();
+        if !st.list.search_focus {
+            return Flow::Continue;
+        }
+        if !event.c.is_control() && st.list.query.chars().count() < ui::QUERY_MAX {
+            st.list.query.push(event.c);
+            st.filter_changed(Instant::now());
         }
         Flow::Cancel
     }
@@ -669,7 +798,8 @@ fn rrect(host: &dyn Host, b: &mut HudBatch, r: Rect, radius: f32, argb: u32) {
 
 /// With `HUSHLIST_TRACE` set, writes the visible rows (identity and rectangle) to
 /// `<trace>.rows.json`, so an automated test can find a row by its sound.
-fn dump_rows(st: &mut State, rows: &[Row], list: Rect, now: Instant) {
+fn dump_rows(st: &mut State, rows: &[Row], lay: &ui::Layout, now: Instant) {
+    let list = lay.list;
     let Some(trace) = std::env::var_os("HUSHLIST_TRACE") else { return };
     if st.rows_dumped.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(250)) {
         return;
@@ -679,14 +809,29 @@ fn dump_rows(st: &mut State, rows: &[Row], list: Rect, now: Instant) {
         .into_iter()
         .map(|(i, r)| {
             format!(
-                "{{\"id\":\"{}\",\"child\":{},\"own\":{},\"volume\":{},\"count\":{},\"rect\":[{},{},{},{}]}}",
-                row_id(&rows[i]), rows[i].child, rows[i].own, rows[i].volume, rows[i].count, r[0], r[1], r[2], r[3]
+                "{{\"id\":\"{}\",\"child\":{},\"own\":{},\"volume\":{},\"count\":{},\"name\":{:?},\"rect\":[{},{},{},{}]}}",
+                row_id(&rows[i]), rows[i].child, rows[i].own, rows[i].volume, rows[i].count,
+                match &rows[i].key {
+                    Key::Group(g) => group_name(g),
+                    Key::Sound(s) => sound_name(&st.subtitles, s),
+                    Key::More(_) => String::new(),
+                },
+                r[0], r[1], r[2], r[3]
             )
         })
         .collect();
     let mut path = std::path::PathBuf::from(trace);
     path.as_mut_os_string().push(".rows.json");
-    let _ = std::fs::write(path, format!("[{}]", items.join(",")));
+    let r = |r: Rect| format!("[{},{},{},{}]", r[0], r[1], r[2], r[3]);
+    let chips: Vec<String> = lay.chips.iter().map(|c| r(*c)).collect();
+    let chip_ids: Vec<String> = st.list.chip_order().iter().map(|s| s.to_string()).collect();
+    let layout = format!(
+        "{{\"search\":{},\"search_clear\":{},\"close\":{},\"chips\":[{}],\"chip_sources\":[{}],\"view_flat\":{},\"view_group\":{},\"banner\":{},\"list\":{},\"freeze\":{},\"query\":{:?},\"focus\":{},\"flat\":{}}}",
+        r(lay.search), r(lay.search_clear), r(lay.close), chips.join(","), chip_ids.join(","), r(lay.view_flat),
+        r(lay.view_group), lay.banner.map_or("null".to_owned(), r), r(lay.list), r(lay.freeze), st.list.query,
+        st.list.search_focus, st.list.flat
+    );
+    let _ = std::fs::write(path, format!("{{\"layout\":{layout},\"rows\":[{}]}}", items.join(",")));
 }
 
 fn row_id(row: &Row) -> String {
@@ -719,7 +864,7 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
     let code = lang::code();
     st.gui = [b.width, b.height];
     let (_, rows, fresh) = st.rows(now);
-    let lay = ui::layout(b.width, b.height, st.list.frozen && fresh > 0);
+    let lay = st.layout(host, fresh);
     st.list.scroll = st.list.scroll.min(ui::max_scroll(rows.len(), lay.list));
     let p = lay.panel;
 
@@ -734,6 +879,44 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
     }
     let close_tone = if close_hover { Tone::Text } else { Tone::Dim };
     icon(host, b, Icon::Close, close_tone, [lay.close[0] + 1.0, lay.close[1], ICON_SIZE, lay.close[3]]);
+
+    // Search field: placeholder, typed text (its end when long), caret while it has the keyboard.
+    let s = lay.search;
+    let focus = st.list.search_focus;
+    let s_hover = ui::contains(s, mouse);
+    let s_edge = if focus { FIELD_EDGE_FOCUS } else if s_hover { 0x38_FF_FF_FF } else { EDGE };
+    rrect(host, b, s, 3.0, s_edge);
+    rrect(host, b, [s[0] + 1.0, s[1] + 1.0, s[2] - 2.0, s[3] - 2.0], 2.0, FIELD);
+    icon(host, b, Icon::Search, if focus { Tone::Text } else { Tone::Dim }, [s[0] + 3.0, s[1], ICON_SIZE, s[3]]);
+    let tx = s[0] + 18.0;
+    let room = (s[2] - 18.0 - 16.0).max(0.0);
+    if st.list.query.is_empty() {
+        if !focus {
+            let ph = fit(host, tr("search.placeholder"), room);
+            host.text(b, &ph, [tx, s[1] + 3.0], FAINT, false);
+        }
+    } else {
+        let mut shown: &str = &st.list.query;
+        while host.text_width(shown) > room {
+            let mut chars = shown.chars();
+            chars.next();
+            shown = chars.as_str();
+        }
+        host.text(b, shown, [tx, s[1] + 3.0], TEXT, false);
+        let clear_hover = ui::contains(lay.search_clear, mouse);
+        let tone = if clear_hover { Tone::Text } else { Tone::Faint };
+        icon(host, b, Icon::Close, tone, [lay.search_clear[0] + 1.0, s[1], ICON_SIZE, s[3]]);
+    }
+    if focus && (now_ms / 530) % 2 == 0 {
+        let mut shown: &str = &st.list.query;
+        while host.text_width(shown) > room {
+            let mut chars = shown.chars();
+            chars.next();
+            shown = chars.as_str();
+        }
+        let cx = tx + host.text_width(shown) + 1.0;
+        host.fill(b, [cx, s[1] + 3.0, 1.0, 8.0], argb(TEXT));
+    }
 
     // Tabs: only Recent exists so far.
     let t = lay.tabs;
@@ -751,6 +934,34 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
     }
     host.fill(b, [p[0] + 1.0, t[1] + t[3], p[2] - 2.0, 1.0], EDGE);
 
+    // Category chips: picked ones are filled and move to the front.
+    let order = st.list.chip_order();
+    for (i, r) in lay.chips.iter().enumerate() {
+        let Some(&source) = order.get(i) else { break };
+        let label = tr(ui::category_key(source).unwrap_or_default());
+        let hover = ui::contains(*r, mouse);
+        let rgb = if st.list.cats.contains(&source) {
+            rrect(host, b, *r, 6.5, argb(TEXT));
+            CHIP_ON_TEXT
+        } else {
+            rrect(host, b, *r, 6.5, if hover { 0x40_FF_FF_FF } else { EDGE });
+            rrect(host, b, [r[0] + 1.0, r[1] + 1.0, r[2] - 2.0, r[3] - 2.0], 5.5, argb(0x16_15_1B));
+            if hover { TEXT } else { DIM }
+        };
+        host.text(b, label, [r[0] + 6.0, r[1] + 3.0], rgb, false);
+    }
+    // View: flat list or groups, a two-part switch.
+    let (vf, vg) = (lay.view_flat, lay.view_group);
+    let whole = [vf[0], vf[1], vg[0] + vg[2] - vf[0], vf[3]];
+    rrect(host, b, whole, 3.0, EDGE);
+    rrect(host, b, [whole[0] + 1.0, whole[1] + 1.0, whole[2] - 2.0, whole[3] - 2.0], 2.0, argb(0x16_15_1B));
+    let on = if st.list.flat { vf } else { vg };
+    rrect(host, b, [on[0] + 1.0, on[1] + 1.0, on[2] - 2.0, on[3] - 2.0], 2.0, 0x30_FF_FF_FF);
+    for (r, ic, active) in [(vf, Icon::ViewList, st.list.flat), (vg, Icon::ViewGroups, !st.list.flat)] {
+        let tone = if active || ui::contains(r, mouse) { Tone::Text } else { Tone::Dim };
+        icon(host, b, ic, tone, [r[0] + 2.0, r[1], ICON_SIZE, r[3]]);
+    }
+
     st.anim.banner = approach(st.anim.banner, if lay.banner.is_some() { 1.0 } else { 0.0 }, dt, 16.0);
     if let Some(r) = lay.banner {
         rrect(host, b, r, 3.0, fade(BANNER, st.anim.banner));
@@ -763,7 +974,11 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
         host.text(b, hint, [r[0] + r[2] - host.text_width(hint) - 6.0, r[1] + 3.0], DIM, false);
     }
 
-    if rows.is_empty() {
+    if rows.is_empty() && st.list.filtering() {
+        let l = lay.list;
+        let a = tr("empty.nothing");
+        host.text(b, a, [l[0] + (l[2] - host.text_width(a)) / 2.0, l[1] + 30.0], DIM, false);
+    } else if rows.is_empty() {
         let l = lay.list;
         let a = tr("empty.title");
         let c = tr("empty.text");
@@ -843,6 +1058,8 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
                 }
                 let source = if row.child {
                     String::new()
+                } else if let (true, true, Some(g)) = (st.list.flat, row.inherited, group_key(sid)) {
+                    tr("group.from").replace("{name}", &group_name(&g)) + " · "
                 } else {
                     group_key(sid).map_or_else(|| tr("sound.no_group").to_owned(), |g| group_name(&g)) + " · "
                 };
@@ -916,7 +1133,7 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
             icon(host, b, Icon::Reset, Tone::Own, [c.reset[0] + 1.0, c.reset[1], ICON_SIZE, c.reset[3]]);
         }
     }
-    dump_rows(st, &rows, list, now);
+    dump_rows(st, &rows, &lay, now);
     st.anim.y.retain(|k, _| seen.contains(k));
     st.anim.reveal.retain(|k, _| seen.contains(k));
     st.anim.hover.retain(|k, _| seen.contains(k));
