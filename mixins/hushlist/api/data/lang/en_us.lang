@@ -149,7 +149,7 @@ group.entity.boat=Boat
 
 # Mods menu page
 mod.description=Turn down individual sounds: a live list of what you hear, with a volume for each sound and each group.
-key.open=Open Hushlist
+key.open=Hotkey to open
 page.open=Open Hushlist
 page.open_no_world=Open Hushlist (join a world first)
 page.open_pending=Opens when you return to the game
