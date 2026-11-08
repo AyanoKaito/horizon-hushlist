@@ -146,3 +146,12 @@ group.item.spear=Копьё
 group.item.spear_wood=Деревянное копьё
 group.block.grass=Трава
 group.entity.boat=Лодка
+
+# Mods menu page
+mod.description=Делает тише отдельные звуки: живой список того, что вы слышите, и громкость для каждого звука и группы.
+key.open=Открыть Hushlist
+page.open=Открыть Hushlist
+page.open_no_world=Открыть Hushlist (сначала зайдите в мир)
+page.open_pending=Откроется, когда вернётесь в игру
+page.reset=Сбросить все настройки звуков…
+page.reset_yes=Да, сбросить все настройки звуков

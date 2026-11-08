@@ -2,6 +2,22 @@
 
 Dated record of what was checked and what it proved. Each entry separates what was confirmed from what was not.
 
+## 2026-11-08 — Mods page
+
+**Pin:** Horizon Nightly `6560641ba51a452f6bc2407baa4eb1b3be517ca8`.
+
+**Change:** Hushlist's page in Options > Mods has a key row for the open key and two buttons: "Open Hushlist" and "Reset all sound settings...". The mod's name, description and key caption follow the game's language.
+
+**Findings:** a page button cannot open the mod's screen directly: the screen opens only while the world is played with no menu over it, and a mod cannot close the options menu. So "Open Hushlist" remembers the click and opens the screen as soon as the player is back in the game; its caption says so. Page buttons have no disabled state; without a world the caption asks the player to join one and the click does nothing. Reset swaps the buttons for "Yes, reset all sound settings" and "Cancel".
+
+**Confirmed** (isolated offscreen runs, English and Russian, title screen and a world):
+- without a world the button asks to join a world, and a click changes nothing;
+- Cancel keeps the settings file; Yes empties it;
+- after "Open Hushlist", closing the menus opened the screen;
+- rebinding the key from H to J: H no longer opens the screen, J does.
+
+**Not confirmed:** whether the mod's key also appears in the game's Controls settings.
+
 ## 2026-11-08 — Player screen 0.2.0
 
 **Pin:** Horizon Nightly `6560641ba51a452f6bc2407baa4eb1b3be517ca8`.
