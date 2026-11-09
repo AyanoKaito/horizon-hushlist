@@ -3007,7 +3007,9 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
                 i18n::with_n(&code, "group.more", row.count)
             };
             let w = host.text_width(&label) + 16.0;
-            let btn = [c.name[0] - 4.0, r[1] + 5.0, w, r[3] - 10.0];
+            // Its left edge lines up with the group's sound rows.
+            let left = if row.child { r[0] + ui::CHILD_INDENT } else { r[0] };
+            let btn = [left, r[1] + 5.0, w, r[3] - 10.0];
             let edge = fade(mix(EDGE, 0xFF_FF_FF_FF, 0.15 * h), reveal);
             rrect(host, b, btn, 3.0, edge);
             rrect(host, b, [btn[0] + 1.0, btn[1] + 1.0, btn[2] - 2.0, btn[3] - 2.0], 2.0, fade(mix(BG, ROW_HOVER, h), reveal));
