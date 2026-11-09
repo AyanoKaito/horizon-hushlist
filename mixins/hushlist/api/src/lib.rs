@@ -231,6 +231,10 @@ struct MapState {
     upload: bool,
     /// The image key the game has, and the image's top row in the shared image.
     uploaded_key: Option<String>,
+    /// The terrain the game's image shows. While the zone on it changes (a slider or a corner
+    /// is dragged), the last image stays on screen until the new one arrives a tick later,
+    /// instead of the map going dark.
+    uploaded_terrain: Option<(String, [i32; 2], i32)>,
     top: f32,
 }
 
@@ -1249,6 +1253,7 @@ impl State {
         self.map.top = h as f32;
         self.map.upload = false;
         self.map.uploaded_key = self.map.image_key.clone();
+        self.map.uploaded_terrain = self.map.terrain_key.clone();
     }
 
     fn trace_line(&mut self, now: Instant, body: &str) {
@@ -1910,10 +1915,12 @@ impl Hooks for Hushlist {
         }
         let mut st = self.lock();
         if st.list.tab == Tab::Zones && !st.zone_mode() {
-            st.zscroll = (st.zscroll - event.scroll[1] as f32 * 18.0).max(0.0);
+            let steps = -(event.scroll[1] as f32).signum();
+            st.zscroll = ui::scroll_by(st.zscroll, steps, zn::CARD_H + zn::CARD_GAP);
             return Flow::Cancel;
         }
-        st.list.scroll = (st.list.scroll - event.scroll[1] as f32 * 18.0).max(0.0);
+        let steps = -(event.scroll[1] as f32).signum();
+        st.list.scroll = ui::scroll_by(st.list.scroll, steps, ui::ROW_PITCH);
         Flow::Cancel
     }
 }
@@ -2475,7 +2482,7 @@ fn draw_zones(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
         let el = zn::editor_layout(area, &m);
         let map = el.map;
         rrect(host, b, [map[0] - 1.0, map[1] - 1.0, map[2] + 2.0, map[3] + 2.0], 2.0, EDGE);
-        let ready = st.map.uploaded_key.is_some() && st.map.uploaded_key == st.map.image_key && st.icons_live;
+        let ready = st.map.uploaded_terrain.is_some() && st.map.uploaded_terrain == st.map.terrain_key && st.icons_live;
         if ready {
             host.sprite(b, MOD_IMAGE, [0.0, st.map.top, MAP_PX as f32, MAP_PX as f32], map);
         } else {

@@ -922,6 +922,9 @@ pub fn layout(width: f32, height: f32, banner: bool, m: &Measure, st: &ListState
         r
     });
     let foot_y = y + h - pad - 20.0;
+    // Only Recent (Freeze) and Changed (Reset all) have a footer; elsewhere the list goes down to the edge.
+    let footer = matches!(st.tab, Tab::Recent | Tab::Changed);
+    let list_bottom = if footer { foot_y - 6.0 } else { y + h - pad - 3.0 };
     // In the middle of the footer, where it is easy to find.
     let freeze = [x + ((w - 92.0) / 2.0).floor(), foot_y, 92.0, 20.0];
     let mut sort_menu = Vec::new();
@@ -954,7 +957,7 @@ pub fn layout(width: f32, height: f32, banner: bool, m: &Measure, st: &ListState
         banner,
         zone_row,
         sub_tabs,
-        list: [x + pad, top, w - 2.0 * pad, (foot_y - 6.0 - top).max(0.0)],
+        list: [x + pad, top, w - 2.0 * pad, (list_bottom - top).max(0.0)],
         freeze,
         show_freeze: st.tab == Tab::Recent,
         foot_text: [x + pad + 2.0, foot_y + 6.0],
@@ -1010,8 +1013,19 @@ pub fn content_height(rows: usize) -> f32 {
     rows as f32 * (ROW_H + ROW_GAP)
 }
 
+/// Scrolling moves the list by whole rows: a row cut by the list's edge is not drawn, so a scroll
+/// between rows would leave an empty strip at the top.
+pub const ROW_PITCH: f32 = ROW_H + ROW_GAP;
+
+/// The furthest scroll, in whole rows, so the last row is fully shown.
 pub fn max_scroll(rows: usize, list: Rect) -> f32 {
-    (content_height(rows) - list[3]).max(0.0)
+    let over = (content_height(rows) - list[3]).max(0.0);
+    (over / ROW_PITCH).ceil() * ROW_PITCH
+}
+
+/// `scroll` moved by `steps` rows (positive moves down), kept on whole rows and not above the top.
+pub fn scroll_by(scroll: f32, steps: f32, pitch: f32) -> f32 {
+    (((scroll / pitch).round() + steps) * pitch).max(0.0)
 }
 
 /// Rows fully inside the list, with their rectangles.

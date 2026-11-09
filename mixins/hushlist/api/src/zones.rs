@@ -490,7 +490,9 @@ pub fn list_layout(area: Rect, m: &Measure, count: usize, scroll: f32) -> ListLa
 }
 
 pub fn list_max_scroll(count: usize, area: Rect) -> f32 {
-    (count as f32 * (CARD_H + CARD_GAP) - CARD_GAP - area[3]).max(0.0)
+    let pitch = CARD_H + CARD_GAP;
+    let over = (count as f32 * pitch - CARD_GAP - area[3]).max(0.0);
+    (over / pitch).ceil() * pitch
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
