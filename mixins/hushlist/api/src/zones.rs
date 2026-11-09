@@ -448,6 +448,8 @@ pub struct Measure {
     pub square: f32,
     pub points: f32,
     pub clear: f32,
+    /// The hint above "Clear points" takes two lines.
+    pub hint_two_lines: bool,
     pub near: f32,
     pub far: f32,
     pub save: f32,
@@ -517,7 +519,9 @@ pub struct EditorLayout {
 /// The editor in `area`: the map on the left, the form on the right.
 pub fn editor_layout(area: Rect, m: &Measure) -> EditorLayout {
     let [x, y, w, h] = area;
-    let side = h.min(w * 0.5).min(256.0).floor();
+    // The map grows with the window, up to 384 points: twice that in pixels at GUI scale 2,
+    // which is the map image's size, so blocks stay sharp.
+    let side = h.min(w * 0.62).min(384.0).floor();
     let map = [x, y, side, side];
     let fx = x + side + 12.0;
     let fw = (x + w - fx).max(80.0);
@@ -544,12 +548,13 @@ pub fn editor_layout(area: Rect, m: &Measure) -> EditorLayout {
     let (near, far) = seg(fx, cy, m.near, m.far);
     cy += 26.0;
     let radius_label_at = [fx, cy];
-    cy += 12.0;
+    cy += if m.hint_two_lines { 23.0 } else { 12.0 };
     let slider = [fx, cy, fw.min(220.0), 12.0];
     let clear = [fx, cy - 2.0, m.clear + 16.0, 16.0];
     cy += 22.0;
+    // Two lines: the heights, and where they come from.
     let height_at = [fx, cy];
-    cy += 13.0;
+    cy += 24.0;
     let area_at = [fx, cy];
     let foot = y + h - 20.0;
     let cancel = [x + w - m.cancel - 18.0, foot, m.cancel + 18.0, 20.0];
@@ -635,40 +640,43 @@ pub fn editor_hit(lay: &EditorLayout, at: [f32; 2], points: bool) -> EditorHit {
     .map_or(EditorHit::Nothing, |(_, h)| h)
 }
 
-/// The header of an open zone, in the tab row: back, then (after the name and the
-/// sub-tabs) "Edit shape" and "Delete..." on the right, or the delete confirmation.
+/// The row of an open zone, under the main tabs: back, the zone's name and shape, and
+/// "Edit shape" and "Delete..." on the right, or the delete confirmation.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HeadLayout {
     pub back: Rect,
     pub name_at: [f32; 2],
+    /// Room for the name and, after it, the shape or the delete question.
     pub name_room: f32,
-    /// Where the sub-tabs start.
-    pub tabs_x: f32,
     pub edit: Option<Rect>,
     pub delete: Option<Rect>,
     pub yes: Option<Rect>,
     pub no: Option<Rect>,
 }
 
-/// `row` is the tab row; widths: back, name, edit, delete, yes, no.
-pub fn head_layout(row: Rect, back_w: f32, name_w: f32, buttons: [f32; 4], confirm: bool) -> HeadLayout {
-    let [x, y, w, _] = row;
-    let back = [x, y - 1.0, back_w + 16.0, 16.0];
-    let name_room = name_w.min(110.0);
-    let name_at = [back[0] + back[2] + 14.0, y + 3.0];
-    let tabs_x = name_at[0] + name_room + 14.0;
+/// `row` is the zone's row (18 high); widths: back, edit, delete, yes, no.
+pub fn head_layout(row: Rect, back_w: f32, buttons: [f32; 4], confirm: bool) -> HeadLayout {
+    let [x, y, w, h] = row;
+    let by = y + (h - 16.0) / 2.0;
+    let back = [x, by, back_w + 16.0, 16.0];
+    let name_at = [back[0] + back[2] + 12.0, y + (h - 7.0) / 2.0];
     let right = x + w;
     let [edit_w, del_w, yes_w, no_w] = buttons.map(|b| b + 16.0);
-    let mut out = HeadLayout { back, name_at, name_room, tabs_x, ..HeadLayout::default() };
-    if confirm {
-        let no = [right - no_w, y - 1.0, no_w, 16.0];
-        out.yes = Some([no[0] - 5.0 - yes_w, y - 1.0, yes_w, 16.0]);
+    let mut out = HeadLayout { back, name_at, ..HeadLayout::default() };
+    let left_of_buttons = if confirm {
+        let no = [right - no_w, by, no_w, 16.0];
+        let yes = [no[0] - 5.0 - yes_w, by, yes_w, 16.0];
+        out.yes = Some(yes);
         out.no = Some(no);
+        yes[0]
     } else {
-        let delete = [right - del_w, y - 1.0, del_w, 16.0];
-        out.edit = Some([delete[0] - 5.0 - edit_w, y - 1.0, edit_w, 16.0]);
+        let delete = [right - del_w, by, del_w, 16.0];
+        let edit = [delete[0] - 5.0 - edit_w, by, edit_w, 16.0];
+        out.edit = Some(edit);
         out.delete = Some(delete);
-    }
+        edit[0]
+    };
+    out.name_room = (left_of_buttons - 12.0 - name_at[0]).max(0.0);
     out
 }
 
@@ -824,9 +832,9 @@ mod tests {
         assert_eq!(slider_radius(s, 0.0), RADIUS_MIN);
         assert_eq!(slider_radius(s, 1000.0), RADIUS_MAX);
         assert_eq!(slider_radius(s, slider_pos(s, 20)), 20);
-        let m = Measure { circle: 30.0, square: 40.0, points: 30.0, clear: 50.0, near: 30.0, far: 30.0, save: 50.0, cancel: 40.0, new_zone: 0.0 };
+        let m = Measure { circle: 30.0, square: 40.0, points: 30.0, clear: 50.0, near: 30.0, far: 30.0, save: 50.0, cancel: 40.0, new_zone: 0.0, hint_two_lines: false };
         let lay = editor_layout([0.0, 0.0, 600.0, 270.0], &m);
-        assert_eq!(lay.map[2], 256.0);
+        assert_eq!(lay.map[2], 270.0);
         assert!(lay.save[0] + lay.save[2] < lay.cancel[0]);
         assert_eq!(editor_hit(&lay, [lay.square[0] + 3.0, lay.square[1] + 3.0], false), EditorHit::Square);
         assert_eq!(editor_hit(&lay, [lay.points[0] + 3.0, lay.points[1] + 3.0], false), EditorHit::Points);

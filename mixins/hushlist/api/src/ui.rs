@@ -178,10 +178,10 @@ pub struct Measure {
     pub buttons: [f32; 3],
     /// The header's "Profile: ..." label, already cut to fit.
     pub profile: f32,
-    /// Inside a zone: where the sub-tabs start (after the back button and the zone name).
-    pub tab_lead: Option<f32>,
-    /// Inside a zone: a line under the tabs says the settings apply to the zone only.
-    pub zone_bar: bool,
+    /// Inside a zone: its sub-tabs ("Recent here", All, Changed) with their counts.
+    pub sub_tabs: [f32; 3],
+    /// Inside a zone: the zone's row and its sub-tabs sit under the main tabs.
+    pub zone: bool,
 }
 
 impl Measure {
@@ -844,8 +844,10 @@ pub struct Layout {
     /// Sort menu items while the menu is open, under the sort button.
     pub sort_menu: Vec<Rect>,
     pub banner: Option<Rect>,
-    /// Inside a zone: the line that says the settings apply to the zone only.
-    pub zone_bar: Option<Rect>,
+    /// Inside a zone: the zone's row (back, name, shape, Edit shape, Delete...).
+    pub zone_row: Option<Rect>,
+    /// Inside a zone: its sub-tabs, under the zone's row.
+    pub sub_tabs: [Rect; 3],
     pub list: Rect,
     pub freeze: Rect,
     /// The Freeze button exists (Recent only).
@@ -877,10 +879,18 @@ pub fn layout(width: f32, height: f32, banner: bool, m: &Measure, st: &ListState
     let search = [search_x, y + 6.0, (close[0] - 8.0 - search_x).max(40.0), 20.0];
     let search_clear = [search[0] + search[2] - 18.0, search[1], 18.0, 20.0];
     let tabs = [x + pad, y + 32.0, w - 2.0 * pad, 16.0];
-    let zone_bar = m.zone_bar.then(|| [x + pad, y + 52.0, w - 2.0 * pad, 12.0]);
-    let tools_top = y + 56.0 + if m.zone_bar { 16.0 } else { 0.0 };
+    let zone_row = m.zone.then(|| [x + pad, y + 56.0, w - 2.0 * pad, 18.0]);
+    let mut sub_tabs = [[0.0; 4]; 3];
+    if m.zone {
+        let mut sx = x + pad + 2.0;
+        for (i, tw) in m.sub_tabs.iter().enumerate() {
+            sub_tabs[i] = [sx - 3.0, y + 80.0, tw + 6.0, 16.0];
+            sx += tw + 16.0;
+        }
+    }
+    let tools_top = y + 56.0 + if m.zone { 48.0 } else { 0.0 };
     let mut tab_rects = [[0.0; 4]; 4];
-    let mut tx = m.tab_lead.unwrap_or(tabs[0] + 2.0);
+    let mut tx = tabs[0] + 2.0;
     for (i, tw) in m.tabs.iter().enumerate() {
         if *tw <= 0.0 {
             continue;
@@ -942,7 +952,8 @@ pub fn layout(width: f32, height: f32, banner: bool, m: &Measure, st: &ListState
         sort,
         sort_menu,
         banner,
-        zone_bar,
+        zone_row,
+        sub_tabs,
         list: [x + pad, top, w - 2.0 * pad, (foot_y - 6.0 - top).max(0.0)],
         freeze,
         show_freeze: st.tab == Tab::Recent,
@@ -1029,6 +1040,8 @@ pub fn slider_value(slider: Rect, x: f32) -> u8 {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Hit {
     Close,
+    /// A zone's sub-tab ("Recent here", All, Changed) by position.
+    SubTab(usize),
     /// The header's profile button.
     Profile,
     Search,
@@ -1075,6 +1088,9 @@ pub fn hit(lay: &Layout, rows: &[Row], scroll: f32, p: [f32; 2]) -> Hit {
     }
     if contains(lay.profile, p) {
         return Hit::Profile;
+    }
+    if let Some(i) = lay.sub_tabs.iter().position(|r| r[2] > 0.0 && contains(*r, p)) {
+        return Hit::SubTab(i);
     }
     if let Some(i) = lay.tab_rects.iter().position(|r| contains(*r, p)) {
         return Hit::Tab(i);

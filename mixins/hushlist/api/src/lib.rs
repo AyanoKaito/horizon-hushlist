@@ -197,6 +197,8 @@ struct State {
     badges: Vec<(Rect, String)>,
     /// Tab counts: heard recently, sounds in the game, settings.
     counts: [usize; 4],
+    /// Inside a zone: its sub-tab counts (heard here, sounds in the game, the zone's settings).
+    zone_counts: [usize; 3],
     /// Display names and lowercase search text by row key, for the current language.
     /// The All tab sorts and searches about 2000 sounds; this keeps each frame cheap.
     texts: std::cell::RefCell<Texts>,
@@ -212,7 +214,7 @@ struct Texts {
 }
 
 /// Side of the editor's map image in pixels.
-const MAP_PX: usize = 512;
+const MAP_PX: usize = 768;
 
 /// The zone editor's map: the game's map colours of the blocks around the zone, with the zone painted on.
 #[derive(Default)]
@@ -370,8 +372,20 @@ impl State {
         let views = self.views(now);
         // Inside a zone the list shows the zone's settings over the profile's.
         let shown = self.shown_zone_settings();
-        let set_count = shown.as_ref().map_or(self.engine.settings.count(), Settings::count);
-        self.counts = [views.len(), self.catalog.total, set_count, self.world_zones().len()];
+        let zone_set = shown.as_ref().map_or(0, Settings::count);
+        // The main tabs keep counting everything, also inside a zone.
+        let heard = if shown.is_some() {
+            self.engine
+                .recent
+                .list()
+                .iter()
+                .filter(|h| now.saturating_duration_since(h.alive) <= crate::core::RECENT_WINDOW)
+                .count()
+        } else {
+            views.len()
+        };
+        self.counts = [heard, self.catalog.total, self.engine.settings.count(), self.world_zones().len()];
+        self.zone_counts = [views.len(), self.catalog.total, zone_set];
         if self.list.tab == Tab::Zones {
             return (views, Vec::new(), 0);
         }
@@ -480,11 +494,11 @@ impl State {
         let mut tabs = [0.0; 4];
         let zone = self.zone_mode();
         for (i, t) in Tab::ORDER.iter().enumerate() {
-            tabs[i] = match (zone, t) {
-                (true, Tab::Zones) => 0.0,
-                (true, Tab::Recent) => host.text_width(&format!("{} {}", tr("zones.here"), self.counts[0])),
-                _ => host.text_width(&tab_label(*t, &self.counts)),
-            };
+            tabs[i] = host.text_width(&tab_label(*t, &self.counts));
+        }
+        let mut sub_tabs = [0.0; 3];
+        for (i, t) in Tab::ORDER.iter().take(3).enumerate() {
+            sub_tabs[i] = host.text_width(&format!("{} {}", sub_tab_name(*t), self.zone_counts[i]));
         }
         let m = ui::Measure {
             chips,
@@ -492,16 +506,10 @@ impl State {
             sort_items: sort_keys(self.list.tab).iter().map(|k| w(k)).collect(),
             buttons: [w("changed.reset_all"), w("button.reset"), w("button.cancel")],
             profile: host.text_width(&self.profile_label(host)),
-            tab_lead: None,
-            zone_bar: false,
+            sub_tabs,
+            zone,
         };
         let banner = self.list.tab == Tab::Recent && self.list.frozen && fresh > 0;
-        let mut m = m;
-        if zone {
-            let first = ui::layout(self.gui[0], self.gui[1], banner, &m, &self.list);
-            m.tab_lead = Some(self.zone_head(host, &first).tabs_x);
-            m.zone_bar = true;
-        }
         ui::layout(self.gui[0], self.gui[1], banner, &m, &self.list)
     }
 
@@ -872,6 +880,7 @@ impl State {
             square: w("zones.square"),
             points: w("zones.points"),
             clear: w("zones.clear"),
+            hint_two_lines: self.editor.as_ref().is_some_and(|e| e.shape == Shape::Points),
             near: w("zones.near"),
             far: w("zones.far"),
             save: w("zones.save"),
@@ -883,10 +892,10 @@ impl State {
     fn zone_head(&self, host: &dyn Host, lay: &ui::Layout) -> HeadLayout {
         let name = self.open_zone_index().map(|i| self.engine.zones[i].name.clone()).unwrap_or_default();
         let w = |key: &'static str| host.text_width(tr(key));
+        let _ = name;
         zn::head_layout(
-            lay.tabs,
+            lay.zone_row.unwrap_or(lay.tabs),
             w("zones.back"),
-            host.text_width(&name) + 12.0,
             [w("zones.edit"), w("zones.delete"), w("zones.delete_yes"), w("button.cancel")],
             self.zone_confirm,
         )
@@ -1605,6 +1614,15 @@ impl Hooks for Hushlist {
         match hit {
             Hit::Close => st.close = true,
             Hit::Profile => st.open_page(),
+            Hit::SubTab(k) => {
+                let tab = Tab::ORDER[k];
+                if tab != st.list.tab {
+                    st.list.tab = tab;
+                    st.filter_changed(now);
+                    st.anim.y.clear();
+                    st.anim.reveal.clear();
+                }
+            }
             Hit::Tab(i) => {
                 let tab = Tab::ORDER[i];
                 if st.editor.is_some() {
@@ -1612,8 +1630,14 @@ impl Hooks for Hushlist {
                     st.zone_open = None;
                     st.zone_drag = false;
                 }
-                if tab == Tab::Zones && st.zone_open.is_some() {
+                // Inside a zone every main tab leaves it: "Zones" back to the zone list, the
+                // others to their own list.
+                if st.zone_open.is_some() {
                     st.leave_zone();
+                    if tab != Tab::Zones {
+                        st.list.tab = tab;
+                        st.filter_changed(now);
+                    }
                 } else if tab.ready() && tab != st.list.tab {
                     st.list.tab = tab;
                     st.filter_changed(now);
@@ -2019,7 +2043,7 @@ fn dump_rows(st: &mut State, rows: &[Row], lay: &ui::Layout, now: Instant) {
         r(lay.profile), r(lay.search), r(lay.search_clear), r(lay.close), chips.join(","), chip_ids.join(","), r(lay.view_flat),
         r(lay.view_group), lay.banner.map_or("null".to_owned(), r), r(lay.list), r(lay.freeze), st.list.query,
         st.list.search_focus, st.list.flat, st.list.tab,
-        lay.tab_rects.iter().map(|t| r(*t)).collect::<Vec<_>>().join(","),
+        lay.tab_rects.iter().chain(lay.sub_tabs.iter()).map(|t| r(*t)).collect::<Vec<_>>().join(","),
         lay.sort.map_or("null".to_owned(), r),
         lay.sort_menu.iter().map(|t| r(*t)).collect::<Vec<_>>().join(","),
         lay.reset_all.map_or("null".to_owned(), r),
@@ -2349,27 +2373,42 @@ fn read_terrain_full(host: &dyn Host, origin: [i32; 2], span: i32) -> (Vec<u32>,
 
 /// Inside a zone: back, the zone's name, the sub-tabs, "Edit shape" and "Delete...", and the line
 /// that says the settings apply to this zone only (or the delete question).
+/// A zone's sub-tab name: "Recent here", All, Changed.
+fn sub_tab_name(tab: Tab) -> &'static str {
+    if tab == Tab::Recent { tr("zones.here") } else { tr(tab_key(tab)) }
+}
+
+/// Inside a zone, under the main tabs: the zone's row (back to all zones, its colour, name and
+/// shape, Edit shape and Delete...) and its sub-tabs with a line in the zone's colour.
 fn draw_zone_head(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layout, mouse: [f32; 2]) {
     let head = st.zone_head(host, lay);
     let Some(i) = st.open_zone_index() else { return };
     let zone = st.engine.zones[i].clone();
+    let code = lang::code();
     button(host, b, head.back, tr("zones.back"), TEXT, EDGE, ui::contains(head.back, mouse));
     let col = zn::color(i);
-    rrect(host, b, [head.name_at[0], head.name_at[1] + 1.0, 6.0, 6.0], 1.0, argb(col));
-    host.text(b, &fit(host, &zone.name, head.name_room), [head.name_at[0] + 10.0, head.name_at[1]], TEXT, false);
-    let t = lay.tabs;
+    let [nx, ny] = head.name_at;
+    rrect(host, b, [nx, ny, 7.0, 7.0], 2.0, argb(col));
+    let name = fit(host, &zone.name, (head.name_room - 12.0).max(20.0));
+    host.text(b, &name, [nx + 12.0, ny], TEXT, false);
+    let after = nx + 12.0 + host.text_width(&name) + 10.0;
+    let room = (nx + head.name_room - after).max(0.0);
+    let (note, rgb) = if st.zone_confirm {
+        (tr("zones.delete_q").replace("{name}", &zone.name), DANGER)
+    } else {
+        (zone_meta(&code, &zone), FAINT)
+    };
+    host.text(b, &fit(host, &note, room), [after, ny], rgb, false);
     for (k, tab) in Tab::ORDER.iter().take(3).enumerate() {
-        let r = lay.tab_rects[k];
+        let r = lay.sub_tabs[k];
         let x = r[0] + 3.0;
-        let label = if *tab == Tab::Recent { tr("zones.here") } else { tr(tab_key(*tab)) };
+        let label = sub_tab_name(*tab);
         let active = *tab == st.list.tab;
         let rgb = if active || ui::contains(r, mouse) { TEXT } else { DIM };
-        host.text(b, label, [x, ty(t)], rgb, false);
-        if let Some(n) = tab_count(*tab, &st.counts) {
-            host.text(b, &n.to_string(), [x + host.text_width(label) + host.text_width(" "), ty(t)], FAINT, false);
-        }
+        host.text(b, label, [x, ty(r)], rgb, false);
+        host.text(b, &st.zone_counts[k].to_string(), [x + host.text_width(label) + host.text_width(" "), ty(r)], FAINT, false);
         if active {
-            rrect(host, b, [x - 1.0, t[1] + t[3] - 2.0, r[2] - 4.0, 2.0], 1.0, argb(TEXT));
+            rrect(host, b, [x - 1.0, r[1] + r[3] - 2.0, r[2] - 4.0, 2.0], 1.0, argb(col));
         }
     }
     let small = |host: &dyn Host, b: &mut HudBatch, r: Option<Rect>, key: &'static str, danger: bool| {
@@ -2384,15 +2423,23 @@ fn draw_zone_head(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::L
     small(host, b, head.delete, "zones.delete", true);
     small(host, b, head.yes, "zones.delete_yes", true);
     small(host, b, head.no, "button.cancel", false);
-    if let Some(bar) = lay.zone_bar {
-        let (text, rgb) = if st.zone_confirm {
-            (tr("zones.delete_q").replace("{name}", &zone.name), DANGER)
-        } else {
-            (tr("zones.bar").replace("{name}", &zone.name), DIM)
-        };
-        host.text(b, &fit(host, &text, bar[2] - 4.0), [bar[0] + 2.0, ty(bar)], rgb, false);
-    }
     st.head = Some(head);
+}
+
+/// `text` in at most two lines of `room`: as many words as fit, then the rest cut to fit.
+fn two_lines(host: &dyn Host, text: &str, room: f32) -> (String, String) {
+    let mut first = String::new();
+    let mut words = text.split(' ').peekable();
+    while let Some(word) = words.peek() {
+        let next = if first.is_empty() { (*word).to_owned() } else { format!("{first} {word}") };
+        if host.text_width(&next) > room && !first.is_empty() {
+            break;
+        }
+        first = next;
+        words.next();
+    }
+    let rest = fit(host, &words.collect::<Vec<_>>().join(" "), room);
+    (first, rest)
 }
 
 /// A zone's one-line description: shape and size, area, height.
@@ -2501,7 +2548,9 @@ fn draw_zones(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
         seg(host, b, &[(el.near, tr("zones.near")), (el.far, tr("zones.far"))], usize::from(e.far));
         let form_room = area[0] + area[2] - el.form_x;
         if e.shape == Shape::Points {
-            host.text(b, &fit(host, tr("zones.points_hint"), form_room), el.radius_label_at, TEXT, false);
+            let (a, c) = two_lines(host, tr("zones.points_hint"), form_room);
+            host.text(b, &a, el.radius_label_at, TEXT, false);
+            host.text(b, &c, [el.radius_label_at[0], el.radius_label_at[1] + 11.0], TEXT, false);
             let c = el.clear;
             let any = !e.points.is_empty();
             button(host, b, c, tr("zones.clear"), if any { TEXT } else { FAINT }, EDGE, any && ui::contains(c, mouse));
@@ -2521,6 +2570,7 @@ fn draw_zones(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
         }
         let height = tr("zones.height").replace("{list}", &format!("{}–{}", e.low, e.high));
         host.text(b, &fit(host, &height, form_room), el.height_at, DIM, false);
+        host.text(b, &fit(host, tr("zones.height_note"), form_room), [el.height_at[0], el.height_at[1] + 11.0], FAINT, false);
         if e.complete() {
             host.text(b, &i18n::with_n(&code, "zones.area", e.area()), el.area_at, DIM, false);
         } else {
@@ -2785,11 +2835,12 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
     if st.zone_mode() {
         draw_zone_head(st, host, b, &lay, mouse);
     }
-    for (i, tab) in Tab::ORDER.iter().enumerate().filter(|_| !st.zone_mode()) {
+    let in_zone = st.zone_mode();
+    for (i, tab) in Tab::ORDER.iter().enumerate() {
         let r = lay.tab_rects[i];
         let x = r[0] + 3.0;
         let label = tr(tab_key(*tab));
-        let active = *tab == st.list.tab;
+        let active = if in_zone { *tab == Tab::Zones } else { *tab == st.list.tab };
         let rgb = if active {
             TEXT
         } else if !tab.ready() {
