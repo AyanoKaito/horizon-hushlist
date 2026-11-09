@@ -70,10 +70,12 @@ const MENU: u32 = 0xFC_22_20_2A;
 
 // Icon sheet (tools/make_icons.py): one column per icon, one row per colour,
 // 24 px cells drawn into 12 GUI pixels. Uploaded into the mods' image slot.
-const ICON_SHEET: &[u8] = include_bytes!("../data/icons.png");
-const ICON_CELL: f32 = 24.0;
+/// The icons, 8 by 8 cells each (see the file's header).
+const ICON_TEXT: &str = include_str!("../data/icons.txt");
+/// An icon's slot, and one of its 8 cells.
 const ICON_SIZE: f32 = 12.0;
-const MOD_IMAGE: &str = "horizon/modimage";
+const ICON_PX: f32 = ICON_SIZE / 8.0;
+
 
 #[derive(Clone, Copy)]
 enum Icon {
@@ -182,10 +184,6 @@ struct State {
     started: Option<Instant>,
     /// GUI size of the last drawn frame, for laying out clicks the same way.
     gui: [f32; 2],
-    icons: Option<(u32, u32, Vec<u8>)>,
-    icons_decoded: bool,
-    /// The icon sheet is in the image slot for the open screen.
-    icons_live: bool,
     anim: Anim,
     /// Sound event ID to subtitle key, from the game's sounds.json.
     subtitles: std::collections::HashMap<String, String>,
@@ -213,29 +211,30 @@ struct Texts {
     by_key: std::collections::HashMap<String, (String, String)>,
 }
 
-/// Side of the editor's map image in pixels.
-const MAP_PX: usize = 768;
+/// One stretch of the zone map: `w` blocks of one colour from block (`x`, `y`) to the east. Blocks of
+/// the zone are one each, with the brighter edge that outlines every block of the zone.
+#[derive(Clone, Copy)]
+struct MapRun {
+    x: u16,
+    y: u16,
+    w: u16,
+    rgb: u32,
+    edge: Option<u32>,
+}
 
-/// The zone editor's map: the game's map colours of the blocks around the zone, with the zone painted on.
+/// The zone editor's map: the game's map colours of the blocks around the zone, with the zone painted
+/// on. It is drawn as rectangles, so it needs no image in the game's shared image slot.
 #[derive(Default)]
 struct MapState {
     /// What the terrain was read for: world, north-west column, span in blocks.
     terrain_key: Option<(String, [i32; 2], i32)>,
     /// Shaded map colour (0xRRGGBB) per column, rows north to south.
     terrain: Vec<u32>,
-    /// What the image shows.
+    /// What the runs show.
     image_key: Option<String>,
-    /// MAP_PX by MAP_PX RGBA.
-    image: Vec<u8>,
-    /// The image changed since it was sent to the game.
-    upload: bool,
-    /// The image key the game has, and the image's top row in the shared image.
-    uploaded_key: Option<String>,
-    /// The terrain the game's image shows. While the zone on it changes (a slider or a corner
-    /// is dragged), the last image stays on screen until the new one arrives a tick later,
-    /// instead of the map going dark.
-    uploaded_terrain: Option<(String, [i32; 2], i32)>,
-    top: f32,
+    /// Blocks a side, and the map as runs of one colour.
+    n: usize,
+    runs: Vec<MapRun>,
 }
 
 /// Animation state between frames. Positions and alphas ease toward their targets.
@@ -330,23 +329,47 @@ fn group_name(group: &str) -> String {
     humanize(name)
 }
 
-/// The icon sheet as RGBA8.
-fn decode_icons() -> Option<(u32, u32, Vec<u8>)> {
-    let mut decoder = png::Decoder::new(std::io::Cursor::new(ICON_SHEET));
-    decoder.set_transformations(png::Transformations::EXPAND);
-    let mut reader = decoder.read_info().ok()?;
-    let (w, h) = (reader.info().width, reader.info().height);
-    let mut buf = vec![0u8; w as usize * h as usize * 8];
-    let frame = reader.next_frame(&mut buf).ok()?;
-    let data = &buf[..frame.line_size * frame.height as usize];
-    let rgba = match (frame.color_type, frame.bit_depth) {
-        (png::ColorType::Rgba, png::BitDepth::Eight) => data.to_vec(),
-        (png::ColorType::Rgb, png::BitDepth::Eight) => {
-            data.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 0xFF]).collect()
+/// The icons as runs of drawn cells (`x`, `y`, length), in `Icon` order, read once from
+/// `data/icons.txt` (8 by 8 cells each).
+fn icon_runs() -> &'static [Vec<(u8, u8, u8)>] {
+    static RUNS: std::sync::OnceLock<Vec<Vec<(u8, u8, u8)>>> = std::sync::OnceLock::new();
+    RUNS.get_or_init(|| {
+        let mut icons: Vec<Vec<(u8, u8, u8)>> = Vec::new();
+        let mut rows: Vec<&str> = Vec::new();
+        let flush = |rows: &mut Vec<&str>, icons: &mut Vec<Vec<(u8, u8, u8)>>| {
+            if rows.is_empty() {
+                return;
+            }
+            let mut runs = Vec::new();
+            for (y, row) in rows.iter().enumerate() {
+                let cells: Vec<bool> = row.chars().map(|c| c == '#').collect();
+                let mut x = 0;
+                while x < cells.len() {
+                    if cells[x] {
+                        let start = x;
+                        while x < cells.len() && cells[x] {
+                            x += 1;
+                        }
+                        runs.push((start as u8, y as u8, (x - start) as u8));
+                    } else {
+                        x += 1;
+                    }
+                }
+            }
+            icons.push(runs);
+            rows.clear();
+        };
+        for line in ICON_TEXT.lines() {
+            let line = line.trim();
+            if line.chars().all(|c| c == '#' || c == '.') && line.len() == 8 {
+                rows.push(line);
+            } else {
+                flush(&mut rows, &mut icons);
+            }
         }
-        _ => return None,
-    };
-    Some((w, h, rgba))
+        flush(&mut rows, &mut icons);
+        icons
+    })
 }
 
 impl State {
@@ -1006,32 +1029,31 @@ impl State {
             return;
         }
         let n = span as usize;
-        let cell = MAP_PX / n;
-        let mut img = vec![0u8; MAP_PX * MAP_PX * 4];
+        let mut runs: Vec<MapRun> = Vec::new();
         for dz in 0..n {
-            for dx in 0..n {
+            let mut dx = 0;
+            while dx < n {
                 let (bx, bz) = (origin[0] + dx as i32, origin[1] + dz as i32);
                 let mut c = self.map.terrain.get(dz * n + dx).copied().unwrap_or(0x20_20_24);
                 if let Some((_, col)) = others.iter().find(|(z, _)| z.holds_column(bx, bz)) {
                     c = mix_rgb(c, *col, 0.33);
                 }
-                let inside = e.holds_column(bx, bz);
-                let fill = if inside { mix_rgb(c, OWN, 0.42) } else { c };
-                // Every block of the zone is outlined, so the player can count them.
-                let edge = if inside && cell >= 5 { mix_rgb(c, OWN, 0.75) } else { fill };
-                for py in 0..cell {
-                    for px in 0..cell {
-                        let border = px == 0 || py == 0 || px == cell - 1 || py == cell - 1;
-                        let col = if border { edge } else { fill };
-                        let o = ((dz * cell + py) * MAP_PX + dx * cell + px) * 4;
-                        img[o..o + 4].copy_from_slice(&[(col >> 16) as u8, (col >> 8) as u8, col as u8, 0xFF]);
-                    }
+                if e.holds_column(bx, bz) {
+                    // Every block of the zone is outlined, so the player can count them.
+                    runs.push(MapRun { x: dx as u16, y: dz as u16, w: 1, rgb: mix_rgb(c, OWN, 0.42), edge: Some(mix_rgb(c, OWN, 0.75)) });
+                    dx += 1;
+                    continue;
                 }
+                match runs.last_mut() {
+                    Some(last) if last.edge.is_none() && last.y as usize == dz && (last.x + last.w) as usize == dx && last.rgb == c => last.w += 1,
+                    _ => runs.push(MapRun { x: dx as u16, y: dz as u16, w: 1, rgb: c, edge: None }),
+                }
+                dx += 1;
             }
         }
-        self.map.image = img;
+        self.map.n = n;
+        self.map.runs = runs;
         self.map.image_key = Some(ikey);
-        self.map.upload = true;
     }
 
     /// What the border walls depend on: the zones of this world, their shapes and the player's area.
@@ -1227,34 +1249,7 @@ impl State {
         }
     }
 
-    /// Sends the icon sheet, with the editor's map under it when there is one, to the game's image slot.
-    fn upload_icons(&mut self, host: &mut dyn Host) {
-        if !self.icons_decoded {
-            self.icons_decoded = true;
-            self.icons = decode_icons();
-        }
-        let Some((w, h, rgba)) = &self.icons else { return };
-        let (w, h) = (*w as usize, *h as usize);
-        if self.map.image.is_empty() {
-            self.icons_live = host.mod_image(w as u32, h as u32, rgba);
-            return;
-        }
-        let cw = w.max(MAP_PX);
-        let ch = h + MAP_PX;
-        let mut img = vec![0u8; cw * ch * 4];
-        for y in 0..h {
-            img[y * cw * 4..y * cw * 4 + w * 4].copy_from_slice(&rgba[y * w * 4..(y + 1) * w * 4]);
-        }
-        for y in 0..MAP_PX {
-            let o = (y + h) * cw * 4;
-            img[o..o + MAP_PX * 4].copy_from_slice(&self.map.image[y * MAP_PX * 4..(y + 1) * MAP_PX * 4]);
-        }
-        self.icons_live = host.mod_image(cw as u32, ch as u32, &img);
-        self.map.top = h as f32;
-        self.map.upload = false;
-        self.map.uploaded_key = self.map.image_key.clone();
-        self.map.uploaded_terrain = self.map.terrain_key.clone();
-    }
+
 
     fn trace_line(&mut self, now: Instant, body: &str) {
         if !self.trace_opened {
@@ -1368,7 +1363,6 @@ impl Hooks for Hushlist {
             let mut st = self.lock();
             st.list.search_focus = false;
             st.page = PageState::default();
-            st.upload_icons(host);
         }
     }
 
@@ -1391,16 +1385,7 @@ impl Hooks for Hushlist {
             st.leave_zone();
             st.changed_external();
         }
-        if st.map.upload && host.mod_screen() == Some(MOD_ID) {
-            st.upload_icons(host);
-        }
-        if host.mod_screen() == Some(MOD_ID) {
-            if !st.icons_live {
-                st.upload_icons(host);
-            }
-        } else {
-            st.icons_live = false;
-        }
+
         if std::mem::take(&mut st.close) && host.mod_screen() == Some(MOD_ID) {
             host.mod_screen_close(MOD_ID);
         }
@@ -1935,11 +1920,23 @@ fn argb(rgb: u32) -> u32 {
     0xFF00_0000 | rgb
 }
 
-/// One icon, centred vertically in `r` at its left edge.
+/// One icon, centred vertically in `r` at its left edge: its 8 by 8 cells drawn as rectangles,
+/// 1.5 interface points a cell.
 fn icon(host: &dyn Host, b: &mut HudBatch, icon: Icon, tone: Tone, r: Rect) {
-    let src = [icon as u8 as f32 * ICON_CELL, tone as u8 as f32 * ICON_CELL, ICON_CELL, ICON_CELL];
     let y = (r[1] + (r[3] - ICON_SIZE) / 2.0).floor();
-    host.sprite(b, MOD_IMAGE, src, [r[0], y, ICON_SIZE, ICON_SIZE]);
+    let x = r[0].floor();
+    let rgb = match tone {
+        Tone::Text => TEXT,
+        Tone::Dim => DIM,
+        Tone::Faint => FAINT,
+        Tone::Own => OWN,
+        Tone::Inherited => INH,
+        Tone::IceText => ICE_TEXT,
+    };
+    let Some(runs) = icon_runs().get(icon as usize) else { return };
+    for &(cx, cy, len) in runs {
+        host.fill(b, [x + f32::from(cx) * ICON_PX, y + f32::from(cy) * ICON_PX, f32::from(len) * ICON_PX, ICON_PX], argb(rgb));
+    }
 }
 
 /// Text cut with an ellipsis to fit `width`: a binary search over character
@@ -2306,6 +2303,29 @@ fn dump_page(st: &mut State, lay: &ui::Layout, pl: &PageLayout, now: Instant) {
     let _ = std::fs::write(path, format!("{{\"layout\":{layout},\"rows\":[]}}"));
 }
 
+/// The zone map's runs, scaled into `r`. Edges are rounded to half points, so neighbouring runs
+/// meet without gaps.
+fn draw_map(map: &MapState, host: &dyn Host, b: &mut HudBatch, r: Rect) {
+    if map.n == 0 {
+        return;
+    }
+    let cell = r[2] / map.n as f32;
+    let snap = |v: f32| (v * 2.0).round() / 2.0;
+    for run in &map.runs {
+        let x0 = snap(r[0] + f32::from(run.x) * cell);
+        let x1 = snap(r[0] + f32::from(run.x + run.w) * cell);
+        let y0 = snap(r[1] + f32::from(run.y) * cell);
+        let y1 = snap(r[1] + f32::from(run.y + 1) * cell);
+        match run.edge {
+            Some(edge) if cell >= 2.5 => {
+                host.fill(b, [x0, y0, x1 - x0, y1 - y0], argb(edge));
+                host.fill(b, [x0 + 0.5, y0 + 0.5, x1 - x0 - 1.0, y1 - y0 - 1.0], argb(run.rgb));
+            }
+            _ => host.fill(b, [x0, y0, x1 - x0, y1 - y0], argb(run.rgb)),
+        }
+    }
+}
+
 /// Where the Zones tab's list or editor goes: under the tabs, inside the panel's margin.
 fn zones_area(lay: &ui::Layout) -> Rect {
     let p = lay.panel;
@@ -2482,12 +2502,8 @@ fn draw_zones(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
         let el = zn::editor_layout(area, &m);
         let map = el.map;
         rrect(host, b, [map[0] - 1.0, map[1] - 1.0, map[2] + 2.0, map[3] + 2.0], 2.0, EDGE);
-        let ready = st.map.uploaded_terrain.is_some() && st.map.uploaded_terrain == st.map.terrain_key && st.icons_live;
-        if ready {
-            host.sprite(b, MOD_IMAGE, [0.0, st.map.top, MAP_PX as f32, MAP_PX as f32], map);
-        } else {
-            host.fill(b, map, argb(0x20_20_24));
-        }
+        host.fill(b, map, argb(0x20_20_24));
+        draw_map(&st.map, host, b, map);
         // Mobs and animals on the map: pink for animals (corners are white), light blue for villagers and golems, red for
         // hostile mobs. Players, items and vehicles are left out.
         {
@@ -2767,7 +2783,7 @@ fn dump_zones(st: &mut State, list: Option<&zn::ListLayout>, editor: Option<&zn:
         layout.push_str(&format!(",\"new_zone\":{},\"cards\":[{}]", r(ll.new_zone), cards.join(",")));
     }
     if let (Some(el), Some(e)) = (editor, st.editor.as_ref()) {
-        let ready = st.map.uploaded_key.is_some() && st.map.uploaded_key == st.map.image_key;
+        let ready = !st.map.runs.is_empty();
         layout.push_str(&format!(
             ",\"editor\":true,\"e_name\":{:?},\"e_typing\":{},\"e_shape\":\"{:?}\",\"e_r\":{},\"e_far\":{},\"e_area\":{},\"map_ready\":{},\"map\":{},\"e_field\":{},\"e_circle\":{},\"e_square\":{},\"e_near\":{},\"e_far_btn\":{},\"e_slider\":{},\"e_save\":{},\"e_cancel\":{},\"e_points_btn\":{},\"e_clear\":{},\"e_points\":{:?},\"e_x\":{},\"e_z\":{},\"e_span\":{},\"e_complete\":{},\"e_menu\":{}",
             e.name, e.typing, e.shape, e.r, e.far, e.area(), ready, r(el.map), r(el.name), r(el.circle), r(el.square), r(el.near), r(el.far), r(el.slider), r(el.save), r(el.cancel),
@@ -2852,8 +2868,8 @@ fn draw(st: &mut State, host: &dyn Host, b: &mut HudBatch, mouse: [f32; 2]) {
     rrect(host, b, s, 3.0, s_edge);
     rrect(host, b, [s[0] + 1.0, s[1] + 1.0, s[2] - 2.0, s[3] - 2.0], 2.0, FIELD);
     icon(host, b, Icon::Search, if focus { Tone::Text } else { Tone::Dim }, [s[0] + 4.0, s[1], ICON_SIZE, s[3]]);
-    let tx = s[0] + 20.0;
-    let room = (s[2] - 20.0 - 18.0).max(0.0);
+    let tx = s[0] + 22.0;
+    let room = (s[2] - 22.0 - 18.0).max(0.0);
     if st.list.query.is_empty() {
         if !focus {
             let ph = fit(host, tr("search.placeholder"), room);
