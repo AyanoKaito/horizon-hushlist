@@ -2426,6 +2426,32 @@ fn draw_zone_head(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::L
     st.head = Some(head);
 }
 
+/// A living mob or animal's kind (`chicken`), or None for players, items, vehicles and the like.
+fn map_mob(ent: &horizon_client::mod_api::NativeClientEntity) -> Option<&str> {
+    let kind = ent.kind.trim_start_matches("minecraft:");
+    let skip = ent.player_uuid.is_some()
+        || !ent.alive
+        || matches!(
+            kind,
+            "item" | "experience_orb" | "falling_block" | "item_frame" | "glow_item_frame" | "painting" | "armor_stand" | "marker" | "area_effect_cloud"
+        )
+        || kind.contains("arrow")
+        || kind.ends_with("_boat")
+        || kind.ends_with("minecart");
+    (!skip).then_some(kind)
+}
+
+/// A mob's dot colour on the zone map.
+fn mob_color(kind: &str) -> u32 {
+    if matches!(kind, "villager" | "wandering_trader" | "iron_golem" | "snow_golem") {
+        0x7F_C8_FF
+    } else if ui::guess_source(&format!("entity.{kind}.ambient")) == 5 {
+        0xFF_6A_5A
+    } else {
+        0xFF_B8_D9
+    }
+}
+
 /// A zone's one-line description: shape and size, area, height.
 fn zone_meta(code: &str, z: &Zone) -> String {
     let shape_text = match z.shape {
@@ -2454,6 +2480,25 @@ fn draw_zones(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
             host.sprite(b, MOD_IMAGE, [0.0, st.map.top, MAP_PX as f32, MAP_PX as f32], map);
         } else {
             host.fill(b, map, argb(0x20_20_24));
+        }
+        // Mobs and animals on the map: pink for animals (corners are white), light blue for villagers and golems, red for
+        // hostile mobs. Players, items and vehicles are left out.
+        {
+            let span = e.span() as f64;
+            let ox = f64::from(e.x - e.span() / 2);
+            let oz = f64::from(e.z - e.span() / 2);
+            let dot = if e.far { 2.0 } else { 3.0 };
+            for ent in host.client_entities() {
+                let Some(kind) = map_mob(&ent) else { continue };
+                let mx = map[0] + ((ent.position[0] - ox) / span) as f32 * map[2];
+                let my = map[1] + ((ent.position[2] - oz) / span) as f32 * map[3];
+                if !ui::contains([map[0] + 2.0, map[1] + 2.0, map[2] - 4.0, map[3] - 4.0], [mx, my]) {
+                    continue;
+                }
+                let rgb = mob_color(kind);
+                host.fill(b, [(mx - dot / 2.0 - 1.0).round(), (my - dot / 2.0 - 1.0).round(), dot + 2.0, dot + 2.0], argb(0x17_15_1E));
+                host.fill(b, [(mx - dot / 2.0).round(), (my - dot / 2.0).round(), dot, dot], argb(rgb));
+            }
         }
         // The player: an amber square where they stand.
         if let Some(p) = st.player_pos {
@@ -2587,16 +2632,10 @@ fn draw_zones(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
         // Mobs and animals the client knows, by kind, most first.
         let mut kinds: Vec<(String, usize)> = Vec::new();
         for ent in host.client_entities() {
-            let kind = ent.kind.trim_start_matches("minecraft:");
-            let skip = ent.player_uuid.is_some()
-                || !ent.alive
-                || matches!(kind, "item" | "experience_orb" | "falling_block" | "item_frame" | "glow_item_frame" | "painting" | "armor_stand" | "marker" | "area_effect_cloud")
-                || kind.contains("arrow")
-                || kind.ends_with("_boat")
-                || kind.ends_with("minecart");
+            let Some(kind) = map_mob(&ent) else { continue };
             let [px, py, pz] = ent.position;
             let (bx, by, bz) = (px.floor() as i32, py.floor() as i32, pz.floor() as i32);
-            if skip || by < e.low || by > e.high || !e.holds_column(bx, bz) {
+            if by < e.low || by > e.high || !e.holds_column(bx, bz) {
                 continue;
             }
             let name = lang::get_or(&format!("entity.minecraft.{kind}"), &humanize(kind));
