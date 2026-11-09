@@ -2426,22 +2426,6 @@ fn draw_zone_head(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::L
     st.head = Some(head);
 }
 
-/// `text` in at most two lines of `room`: as many words as fit, then the rest cut to fit.
-fn two_lines(host: &dyn Host, text: &str, room: f32) -> (String, String) {
-    let mut first = String::new();
-    let mut words = text.split(' ').peekable();
-    while let Some(word) = words.peek() {
-        let next = if first.is_empty() { (*word).to_owned() } else { format!("{first} {word}") };
-        if host.text_width(&next) > room && !first.is_empty() {
-            break;
-        }
-        first = next;
-        words.next();
-    }
-    let rest = fit(host, &words.collect::<Vec<_>>().join(" "), room);
-    (first, rest)
-}
-
 /// A zone's one-line description: shape and size, area, height.
 fn zone_meta(code: &str, z: &Zone) -> String {
     let shape_text = match z.shape {
@@ -2508,9 +2492,37 @@ fn draw_zones(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
                 host.text(b, l, [r[0] + 6.0, ty(r)], rgb, false);
             }
         }
+        // A row of joined buttons, one of them on.
+        let seg = |host: &dyn Host, b: &mut HudBatch, parts: &[(Rect, &str)], on: usize, backing: bool| {
+            let (first, last) = (parts[0].0, parts[parts.len() - 1].0);
+            let whole = [first[0], first[1], last[0] + last[2] - first[0], first[3]];
+            if backing {
+                rrect(host, b, [whole[0] - 2.0, whole[1] - 2.0, whole[2] + 4.0, whole[3] + 4.0], 4.0, 0xC8_0E_0D_12);
+            }
+            rrect(host, b, whole, 3.0, EDGE);
+            rrect(host, b, [whole[0] + 1.0, whole[1] + 1.0, whole[2] - 2.0, whole[3] - 2.0], 2.0, argb(0x16_15_1B));
+            let r = parts[on].0;
+            rrect(host, b, [r[0] + 1.0, r[1] + 1.0, r[2] - 2.0, r[3] - 2.0], 2.0, 0x30_FF_FF_FF);
+            for (k, (r, l)) in parts.iter().enumerate() {
+                let rgb = if k == on || ui::contains(*r, mouse) { TEXT } else { DIM };
+                host.text(b, l, [r[0] + (r[2] - host.text_width(l)) / 2.0, ty(*r)], rgb, false);
+            }
+        };
+        // On the map: its scale (top right) and, for points, how to place them (a strip at the bottom).
+        seg(host, b, &[(el.near, tr("zones.near")), (el.far, tr("zones.far"))], usize::from(e.far), true);
+        if e.shape == Shape::Points {
+            let s = [map[0] + 1.0, map[1] + map[3] - 19.0, map[2] - 2.0, 18.0];
+            host.fill(b, s, 0xD0_0E_0D_12);
+            host.text(b, &fit(host, tr("zones.hint_map"), s[2] - 16.0), [s[0] + 8.0, ty(s)], TEXT, false);
+        }
+
+        let form_room = area[0] + area[2] - el.form_x;
+        let rule = |host: &dyn Host, b: &mut HudBatch, y: f32| host.fill(b, [el.form_x, y, form_room, 1.0], EDGE);
         let title = tr(if e.id.is_some() { "zones.title_edit" } else { "zones.title_new" });
         host.text(b, title, el.title_at, TEXT, false);
-        host.text(b, tr("zones.name"), el.name_label_at, DIM, false);
+
+        // Name.
+        host.text(b, tr("zones.name"), el.name_label_at, FAINT, false);
         let f = el.name;
         rrect(host, b, f, 3.0, if e.typing { FIELD_EDGE_FOCUS } else if ui::contains(f, mouse) { 0x38_FF_FF_FF } else { EDGE });
         rrect(host, b, [f[0] + 1.0, f[1] + 1.0, f[2] - 2.0, f[3] - 2.0], 2.0, FIELD);
@@ -2524,33 +2536,18 @@ fn draw_zones(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
         if e.typing && (now_ms / 530) % 2 == 0 {
             host.fill(b, [f[0] + 6.0 + host.text_width(shown), ty(f), 1.0, 7.0], argb(TEXT));
         }
-        // A row of joined buttons, one of them on.
-        let seg = |host: &dyn Host, b: &mut HudBatch, parts: &[(Rect, &str)], on: usize| {
-            let (first, last) = (parts[0].0, parts[parts.len() - 1].0);
-            let whole = [first[0], first[1], last[0] + last[2] - first[0], first[3]];
-            rrect(host, b, whole, 3.0, EDGE);
-            rrect(host, b, [whole[0] + 1.0, whole[1] + 1.0, whole[2] - 2.0, whole[3] - 2.0], 2.0, argb(0x16_15_1B));
-            let r = parts[on].0;
-            rrect(host, b, [r[0] + 1.0, r[1] + 1.0, r[2] - 2.0, r[3] - 2.0], 2.0, 0x30_FF_FF_FF);
-            for (k, (r, l)) in parts.iter().enumerate() {
-                let rgb = if k == on || ui::contains(*r, mouse) { TEXT } else { DIM };
-                host.text(b, l, [r[0] + (r[2] - host.text_width(l)) / 2.0, ty(*r)], rgb, false);
-            }
-        };
+
+        // Shape, and its size or its corners.
+        rule(host, b, el.rules[0]);
+        host.text(b, tr("zones.sec_shape"), el.shape_label_at, FAINT, false);
         let shape_on = match e.shape {
             Shape::Circle => 0,
             Shape::Square => 1,
             Shape::Points => 2,
         };
         let shapes = [(el.circle, tr("zones.circle")), (el.square, tr("zones.square")), (el.points, tr("zones.points"))];
-        seg(host, b, &shapes, shape_on);
-        host.text(b, tr("zones.scale"), el.zoom_label_at, DIM, false);
-        seg(host, b, &[(el.near, tr("zones.near")), (el.far, tr("zones.far"))], usize::from(e.far));
-        let form_room = area[0] + area[2] - el.form_x;
+        seg(host, b, &shapes, shape_on, false);
         if e.shape == Shape::Points {
-            let (a, c) = two_lines(host, tr("zones.points_hint"), form_room);
-            host.text(b, &a, el.radius_label_at, TEXT, false);
-            host.text(b, &c, [el.radius_label_at[0], el.radius_label_at[1] + 11.0], TEXT, false);
             let c = el.clear;
             let any = !e.points.is_empty();
             button(host, b, c, tr("zones.clear"), if any { TEXT } else { FAINT }, EDGE, any && ui::contains(c, mouse));
@@ -2568,15 +2565,26 @@ fn draw_zones(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
             let grow = if st.zone_drag || ui::contains(s, mouse) { 1.0 } else { 0.0 };
             rrect(host, b, [tx - 2.5 - grow * 0.5, cy - 5.0 - grow, 5.0 + grow, 10.0 + grow * 2.0], 2.5, THUMB);
         }
-        let height = tr("zones.height").replace("{list}", &format!("{}–{}", e.low, e.high));
-        host.text(b, &fit(host, &height, form_room), el.height_at, DIM, false);
-        host.text(b, &fit(host, tr("zones.height_note"), form_room), [el.height_at[0], el.height_at[1] + 11.0], FAINT, false);
-        if e.complete() {
-            host.text(b, &i18n::with_n(&code, "zones.area", e.area()), el.area_at, DIM, false);
-        } else {
-            host.text(b, tr("zones.min3"), el.area_at, AMBER, false);
+
+        // What the zone takes: its area, its heights, who is in it now.
+        rule(host, b, el.rules[1]);
+        host.text(b, tr("zones.sec_summary"), el.summary_label_at, FAINT, false);
+        let labels = [tr("zones.row_area"), tr("zones.row_height"), tr("zones.row_now")];
+        let value_x = el.form_x + labels.iter().map(|l| host.text_width(l)).fold(0.0, f32::max) + 10.0;
+        let rows_at = [el.area_at, el.height_at, el.now_at];
+        for (l, at) in labels.iter().zip(rows_at) {
+            host.text(b, l, at, DIM, false);
         }
-        // Who is in the zone now: mobs and animals the client knows, by kind, most first.
+        if e.complete() {
+            host.text(b, &i18n::plural(&code, "zones.blocks", u64::from(e.area())), [value_x, el.area_at[1]], TEXT, false);
+        } else {
+            host.text(b, tr("zones.min3"), [value_x, el.area_at[1]], AMBER, false);
+        }
+        let heights = format!("y {}–{}", e.low, e.high);
+        host.text(b, &heights, [value_x, el.height_at[1]], TEXT, false);
+        host.text(b, &fit(host, tr("zones.from_you"), area[0] + area[2] - value_x - host.text_width(&heights) - 8.0),
+            [value_x + host.text_width(&heights) + 8.0, el.height_at[1]], FAINT, false);
+        // Mobs and animals the client knows, by kind, most first.
         let mut kinds: Vec<(String, usize)> = Vec::new();
         for ent in host.client_entities() {
             let kind = ent.kind.trim_start_matches("minecraft:");
@@ -2598,19 +2606,17 @@ fn draw_zones(st: &mut State, host: &dyn Host, b: &mut HudBatch, lay: &ui::Layou
             }
         }
         kinds.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        let now_at = [el.area_at[0], el.area_at[1] + 16.0];
-        host.text(b, tr("zones.inside_now"), now_at, DIM, false);
-        let mut cx = now_at[0];
-        let mut cy = now_at[1] + 12.0;
         if kinds.is_empty() {
-            host.text(b, tr("zones.nobody"), [cx, cy + 3.5], FAINT, false);
+            host.text(b, tr("zones.nobody"), [value_x, el.now_at[1]], FAINT, false);
         }
         let right = area[0] + area[2];
+        let mut cx = value_x;
+        let mut cy = el.now_at[1] - 3.5;
         for (name, n) in &kinds {
             let label = format!("{name} {n}");
             let w = host.text_width(&label) + 12.0;
-            if cx + w > right && cx > now_at[0] {
-                cx = now_at[0];
+            if cx + w > right && cx > value_x {
+                cx = value_x;
                 cy += 18.0;
             }
             if cy + 14.0 > el.save[1] - 6.0 {

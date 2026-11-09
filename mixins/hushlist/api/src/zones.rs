@@ -505,7 +505,12 @@ pub struct EditorLayout {
     pub points: Rect,
     /// "Clear points", where the radius slider is for the other shapes.
     pub clear: Rect,
-    pub zoom_label_at: [f32; 2],
+    /// Section labels: "Shape" and "What the zone takes", and the lines above them.
+    pub shape_label_at: [f32; 2],
+    pub summary_label_at: [f32; 2],
+    pub rules: [f32; 2],
+    /// The summary's third row: who is in the zone now.
+    pub now_at: [f32; 2],
     pub near: Rect,
     pub far: Rect,
     pub radius_label_at: [f32; 2],
@@ -534,28 +539,36 @@ pub fn editor_layout(area: Rect, m: &Measure) -> EditorLayout {
         let (r1, r2) = seg(at, top, a, b);
         (r1, r2, [r2[0] + r2[2], top, c + 16.0, 16.0])
     };
+    // Three sections on the right: the name, the shape, and what the zone takes. The map's own
+    // controls (its scale) sit on the map.
     let mut cy = y + 2.0;
     let title_at = [fx, cy];
-    cy += 16.0;
+    cy += 20.0;
     let name_label_at = [fx, cy];
-    cy += 11.0;
+    cy += 12.0;
     let name = [fx, cy, fw.min(220.0), 16.0];
-    cy += 24.0;
+    cy += 28.0;
+    let rule1 = cy;
+    cy += 10.0;
+    let shape_label_at = [fx, cy];
+    cy += 12.0;
     let (circle, square, points) = seg3(fx, cy, m.circle, m.square, m.points);
     cy += 26.0;
-    let zoom_label_at = [fx, cy];
-    cy += 11.0;
-    let (near, far) = seg(fx, cy, m.near, m.far);
-    cy += 26.0;
     let radius_label_at = [fx, cy];
-    cy += if m.hint_two_lines { 23.0 } else { 12.0 };
-    let slider = [fx, cy, fw.min(220.0), 12.0];
     let clear = [fx, cy - 2.0, m.clear + 16.0, 16.0];
-    cy += 22.0;
-    // Two lines: the heights, and where they come from.
-    let height_at = [fx, cy];
+    cy += 12.0;
+    let slider = [fx, cy, fw.min(220.0), 12.0];
     cy += 24.0;
+    let rule2 = cy;
+    cy += 10.0;
+    let summary_label_at = [fx, cy];
+    cy += 15.0;
     let area_at = [fx, cy];
+    let height_at = [fx, cy + 14.0];
+    let now_at = [fx, cy + 28.0];
+    let total = m.near + m.far + 32.0;
+    let near = [x + side - 6.0 - total, y + 6.0, m.near + 16.0, 16.0];
+    let far = [near[0] + near[2], y + 6.0, m.far + 16.0, 16.0];
     let foot = y + h - 20.0;
     let cancel = [x + w - m.cancel - 18.0, foot, m.cancel + 18.0, 20.0];
     let save = [cancel[0] - 5.0 - m.save - 18.0, foot, m.save + 18.0, 20.0];
@@ -569,7 +582,10 @@ pub fn editor_layout(area: Rect, m: &Measure) -> EditorLayout {
         square,
         points,
         clear,
-        zoom_label_at,
+        shape_label_at,
+        summary_label_at,
+        rules: [rule1, rule2],
+        now_at,
         near,
         far,
         radius_label_at,
@@ -623,6 +639,9 @@ pub fn editor_hit(lay: &EditorLayout, at: [f32; 2], points: bool) -> EditorHit {
     let none = [0.0; 4];
     let (slider, clear) = if points { (none, lay.clear) } else { (slider, none) };
     [
+        // The scale switch lies on the map, so it is asked first.
+        (lay.near, EditorHit::Near),
+        (lay.far, EditorHit::Far),
         (lay.map, EditorHit::Map),
         (lay.name, EditorHit::Name),
         (lay.circle, EditorHit::Circle),

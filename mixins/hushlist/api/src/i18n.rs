@@ -52,8 +52,39 @@ pub fn with_n(code: &str, key: &'static str, n: impl std::fmt::Display) -> Strin
     text(code, key).replace("{n}", &n.to_string())
 }
 
+/// A count with its noun in the right form: `{base}.one`, `.few`, `.many` for Russian, `.one` and
+/// `.other` otherwise, `{n}` replaced (every language file has all four keys).
+pub fn plural(code: &str, base: &str, n: u64) -> String {
+    let form = if code.starts_with("ru") {
+        let (m10, m100) = (n % 10, n % 100);
+        if m10 == 1 && m100 != 11 {
+            "one"
+        } else if (2..=4).contains(&m10) && !(12..=14).contains(&m100) {
+            "few"
+        } else {
+            "many"
+        }
+    } else if n == 1 {
+        "one"
+    } else {
+        "other"
+    };
+    lookup(code, &format!("{base}.{form}")).unwrap_or(base).replace("{n}", &n.to_string())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn russian_plurals_pick_the_right_form() {
+        assert_eq!(plural("ru_ru", "zones.blocks", 1), "1 блок");
+        assert_eq!(plural("ru_ru", "zones.blocks", 3), "3 блока");
+        assert_eq!(plural("ru_ru", "zones.blocks", 11), "11 блоков");
+        assert_eq!(plural("ru_ru", "zones.blocks", 64), "64 блока");
+        assert_eq!(plural("ru_ru", "zones.blocks", 121), "121 блок");
+        assert_eq!(plural("en_us", "zones.blocks", 1), "1 block");
+        assert_eq!(plural("en_us", "zones.blocks", 64), "64 blocks");
+    }
+
     use super::*;
 
     fn placeholders(s: &str) -> Vec<&str> {
